@@ -86,7 +86,14 @@
           name = "ai-jail";
           src = ./.;
           cargoLock.lockFile = ./Cargo.lock;
+
           buildInputs = [ pkgs.bubblewrap ];
+          nativeBuildInputs = [ pkgs.makeWrapper ];
+
+          postFixup = ''
+            wrapProgram "$out/bin/ai-jail" \
+              --set BWRAP_BIN "${pkgs.bubblewrap}/bin/bwrap"
+          '';
         };
 
         formatter = formatter;

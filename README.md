@@ -49,6 +49,7 @@ cp target/release/ai-jail ~/.local/bin/
   - Arch: `pacman -S bubblewrap`
   - Debian/Ubuntu: `apt install bubblewrap`
   - Fedora: `dnf install bubblewrap`
+  - If `bwrap` is in a non-standard location (e.g. Nix store), set `BWRAP_BIN=/absolute/path/to/bwrap`.
 - macOS: `/usr/bin/sandbox-exec` is used (legacy/deprecated Apple interface).
 
 ## Quick Start

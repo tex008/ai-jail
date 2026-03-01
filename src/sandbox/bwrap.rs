@@ -194,22 +194,42 @@ const LOCAL_SHARE_RW: &[&str] = &[
     "uv",
 ];
 
+const BWRAP_ENV_VAR: &str = "BWRAP_BIN";
 const BWRAP_CANDIDATES: &[&str] = &["/usr/bin/bwrap", "/bin/bwrap", "/usr/local/bin/bwrap"];
 
 fn bwrap_binary_path() -> Result<PathBuf, String> {
+    let mut override_error: Option<String> = None;
+
+    if let Some(raw) = std::env::var_os(BWRAP_ENV_VAR) {
+        let p = PathBuf::from(raw);
+        if p.is_absolute() && p.is_file() {
+            return Ok(p);
+        }
+        override_error = Some(format!(
+            "{BWRAP_ENV_VAR} is set to {} but it is not an absolute existing file",
+            p.display()
+        ));
+    }
+
     for candidate in BWRAP_CANDIDATES {
         let p = PathBuf::from(candidate);
         if p.is_file() {
             return Ok(p);
         }
     }
-    Err(
+
+    let mut msg = String::from(
         "bwrap (bubblewrap) not found in trusted locations. Install it:\n  \
          Arch: pacman -S bubblewrap\n  \
          Debian/Ubuntu: apt install bubblewrap\n  \
-         Fedora: dnf install bubblewrap"
-            .into(),
-    )
+         Fedora: dnf install bubblewrap\n\
+         Or set BWRAP_BIN=/absolute/path/to/bwrap",
+    );
+    if let Some(err) = override_error {
+        msg.push_str("\n");
+        msg.push_str(&err);
+    }
+    Err(msg)
 }
 
 fn should_use_new_session(lockdown: bool) -> bool {
@@ -892,5 +912,31 @@ mod tests {
             args.first().is_some_and(|s| s.starts_with('/')),
             "dry-run must show absolute bwrap path"
         );
+    }
+
+    #[test]
+    fn bwrap_bin_env_override_is_used() {
+        let tmp = std::env::temp_dir().join(format!("ai-jail-bwrap.{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&tmp);
+        let bwrap = tmp.join("bwrap");
+        std::fs::write(&bwrap, b"#!/bin/sh\n").unwrap();
+
+        unsafe { std::env::set_var(BWRAP_ENV_VAR, &bwrap) };
+        let selected = bwrap_program_for_exec();
+        unsafe { std::env::remove_var(BWRAP_ENV_VAR) };
+
+        assert_eq!(selected, bwrap);
+        let _ = std::fs::remove_file(&bwrap);
+        let _ = std::fs::remove_dir(&tmp);
+    }
+
+    #[test]
+    fn bwrap_bin_env_override_invalid_path_falls_back() {
+        unsafe { std::env::set_var(BWRAP_ENV_VAR, "/definitely/not/a/real/bwrap") };
+        let selected = bwrap_program_for_exec();
+        unsafe { std::env::remove_var(BWRAP_ENV_VAR) };
+
+        assert!(selected.is_absolute());
+        assert_eq!(selected.file_name().and_then(|s| s.to_str()), Some("bwrap"));
     }
 }
