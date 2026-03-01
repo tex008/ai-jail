@@ -36,63 +36,53 @@ ai-jail --dry-run claude
 
 On first run, `ai-jail` creates a `.ai-jail` config file in the current directory. Subsequent runs reuse that config. Commit `.ai-jail` to your repo so the sandbox settings follow the project.
 
-## Security Notes (Important)
+## Security notes
 
-The default mode is a usability-oriented sandbox, not a maximal lockbox. The following are intentionally still open in default mode:
+The default mode favors usability over maximum lockdown. These are intentionally open by default:
 
-1. Docker socket passthrough can be auto-enabled when `/var/run/docker.sock` exists (`--no-docker` disables it).
-2. Display passthrough mounts `XDG_RUNTIME_DIR` on Linux, which can expose extra host IPC sockets.
-3. Environment variables are inherited by default (tokens/secrets in your shell env are visible in-jail).
+1. Docker socket passthrough auto-enables when `/var/run/docker.sock` exists (`--no-docker` disables it).
+2. Display passthrough mounts `XDG_RUNTIME_DIR` on Linux, which can expose host IPC sockets.
+3. Environment variables are inherited (tokens/secrets in your shell env are visible in-jail).
 
-If you want a suspicious command / malware-analysis posture, use `--lockdown` (see below).
+For hostile/untrusted workloads, use `--lockdown` (see below).
 
-## Sandbox Model Differences
+## What this is and isn't
 
-`ai-jail` is a thin wrapper around native OS sandboxing, so security properties depend on the backend:
+ai-jail is a thin wrapper around OS-level sandboxing, so its security properties depend on the backend:
 
 - `bwrap` (Linux): namespace + mount sandboxing in userspace.
-- `sandbox-exec` / seatbelt profile (macOS): legacy policy interface to Apple sandbox rules.
-- `AppContainer` (Windows): token/capability-based app sandbox model (not currently implemented by `ai-jail`).
+- `sandbox-exec` / seatbelt (macOS): legacy policy interface to Apple sandbox rules.
 
-Important differences and inherent limits (cannot be fully solved in this project):
+Some things to keep in mind:
 
-- Kernel trust boundary:
-  `bwrap`, seatbelt, and AppContainer all depend on host kernel correctness. Kernel escapes are out of scope for wrapper-level hardening.
-- Shared-kernel model:
-  They are process sandboxes, not hardware isolation. A guest VM gives a stronger boundary because it runs a separate kernel.
-- Side channels and host resource sharing:
-  Timing/cache side channels, scheduler interference, and other shared-resource effects still exist in process sandboxes.
-- Backend maturity and semantics vary by OS:
-  Linux/macOS/Windows primitives are not equivalent; policy parity is approximate, not identical.
-- macOS seatbelt CLI status:
-  `sandbox-exec` is a deprecated interface; long-term behavior is less future-proof than current VM/container stacks.
+- All backends depend on host kernel correctness. Kernel escapes are out of scope.
+- These are process sandboxes, not hardware isolation. A VM runs a separate kernel and gives a stronger boundary.
+- Timing/cache side channels and scheduler interference still exist in process sandboxes.
+- Linux and macOS primitives are not equivalent; cross-platform policy parity is approximate.
+- `sandbox-exec` on macOS is a deprecated interface. It works today but Apple could remove it.
 
-If your expectation is "full isolation against unknown malware", use a dedicated VM (or microVM) with disposable disks/snapshots and treat `ai-jail` as defense-in-depth, not as a complete replacement.
+If you need full isolation against unknown malware, use a disposable VM and treat ai-jail as one layer, not the whole story.
 
-## Lockdown Mode
+## Lockdown mode
 
-`--lockdown` enables strict read-only, ephemeral behavior aimed at hostile workloads.
+`--lockdown` switches to strict read-only, ephemeral behavior for hostile workloads.
 
 ```bash
 ai-jail --lockdown claude
 ```
 
-What `--lockdown` does:
+This:
 
-- Forces read-only project mount.
-- Disables GPU, Docker, display passthrough, and mise integration.
-- Ignores extra map flags from config/CLI (`--rw-map`, `--map`).
-- Mounts `$HOME` as tmpfs only (no host dotfiles layered in).
-- Linux: adds `--clearenv` + minimal env allowlist, `--unshare-net`, `--new-session`.
-- macOS: clears environment to minimal allowlist and removes network/file-write allowances from generated SBPL profile.
+- Mounts the project read-only.
+- Disables GPU, Docker, display passthrough, and mise.
+- Ignores `--rw-map` and `--map` flags.
+- Mounts `$HOME` as bare tmpfs (no host dotfiles).
+- Linux: `--clearenv` with minimal allowlist, `--unshare-net`, `--new-session`.
+- macOS: clears env to minimal allowlist, strips network and file-write rules from SBPL profile.
 
-Persistence behavior:
+Persistence: `--lockdown` alone doesn't write `.ai-jail` (keeps runs ephemeral). Persist it with `ai-jail --init --lockdown`. Undo with `--no-lockdown`.
 
-- Runtime `--lockdown` sessions do not auto-write `.ai-jail` (to keep runs non-persistent).
-- Persist lockdown explicitly with `ai-jail --init --lockdown ...`.
-- Disable persisted lockdown with `--no-lockdown` (and `--init` if you want to write config).
-
-## What Gets Sandboxed
+## What gets sandboxed
 
 ### Default behavior (no flags needed)
 
@@ -112,7 +102,7 @@ In `--lockdown`, project is mounted read-only and host write mounts are removed.
 
 ### Home directory handling
 
-Your real `$HOME` is replaced with a tmpfs. Dotfiles and dotdirs are selectively mounted on top:
+Your real `$HOME` is replaced with a tmpfs. Dotfiles and dotdirs are selectively layered on top:
 
 **Never mounted (sensitive data):**
 - `.gnupg`, `.aws`, `.ssh`, `.mozilla`, `.basilisk-dev`, `.sparrow`
@@ -122,7 +112,7 @@ Your real `$HOME` is replaced with a tmpfs. Dotfiles and dotdirs are selectively
 
 **Everything else:** mounted read-only.
 
-**Additionally hidden (tmpfs over):**
+**Hidden behind tmpfs:**
 - `~/.config/BraveSoftware`, `~/.config/Bitwarden`
 - `~/.cache/BraveSoftware`, `~/.cache/chromium`, `~/.cache/spotify`, `~/.cache/nvidia`, `~/.cache/mesa_shader_cache`, `~/.cache/basilisk-dev`
 
@@ -136,8 +126,8 @@ Your real `$HOME` is replaced with a tmpfs. Dotfiles and dotdirs are selectively
 
 ### Namespace isolation
 
-The sandbox uses PID, UTS, and IPC namespace isolation. The hostname inside is `ai-sandbox`. The process dies when the parent exits (`--die-with-parent`).
-Linux enables `--new-session` for non-interactive runs and always in `--lockdown`. In `--lockdown`, Linux also unshares network.
+PID, UTS, and IPC namespaces are isolated. Hostname inside is `ai-sandbox`. The process dies when the parent exits (`--die-with-parent`).
+`--new-session` is on for non-interactive runs and always in `--lockdown`. In `--lockdown`, Linux also unshares network.
 
 ### mise integration
 
@@ -210,9 +200,9 @@ ai-jail --clean --init claude
 ai-jail -- claude --model opus
 ```
 
-## Config File (`.ai-jail`)
+## Config file (`.ai-jail`)
 
-Created automatically in the project directory on first run. Example:
+Created in the project directory on first run. Example:
 
 ```toml
 # ai-jail sandbox configuration
@@ -227,12 +217,12 @@ lockdown = true
 
 ### Merge behavior
 
-When CLI flags are provided alongside an existing config:
+When CLI flags and an existing config are both present:
 
-- **command**: CLI replaces config
-- **rw_maps / ro_maps**: CLI values are appended (duplicates removed)
-- **Boolean flags**: CLI overrides config (`--no-gpu` sets `no_gpu = true`)
-- The config file is updated after merge in normal mode; lockdown runtime skips auto-save
+- `command`: CLI replaces config
+- `rw_maps` / `ro_maps`: CLI values are appended (duplicates removed)
+- Boolean flags: CLI overrides config (`--no-gpu` sets `no_gpu = true`)
+- Config is updated after merge in normal mode; lockdown skips auto-save
 
 ### Available fields
 
