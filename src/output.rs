@@ -39,6 +39,15 @@ pub fn error(msg: &str) {
     }
 }
 
+pub fn ok(msg: &str) {
+    let mut out = io::stderr().lock();
+    if is_tty() {
+        let _ = writeln!(out, "{BOLD}{GREEN}✓{RESET} {msg}");
+    } else {
+        let _ = writeln!(out, "✓ {msg}");
+    }
+}
+
 pub fn verbose(msg: &str) {
     let mut out = io::stderr().lock();
     if is_tty() {

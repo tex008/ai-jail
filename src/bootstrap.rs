@@ -1,0 +1,584 @@
+use crate::output;
+use std::fs;
+use std::path::{Path, PathBuf};
+
+// ── Permission lists (shared philosophy) ─────────────────────────
+
+const ALLOW: &[&str] = &[
+    // Git read
+    "Bash(git status *)",
+    "Bash(git diff *)",
+    "Bash(git log *)",
+    "Bash(git show *)",
+    "Bash(git fetch *)",
+    "Bash(git pull *)",
+    "Bash(git branch *)",
+    "Bash(git rev-parse *)",
+    "Bash(git ls-files *)",
+    "Bash(git remote -v*)",
+    // Git local-write
+    "Bash(git add *)",
+    "Bash(git commit *)",
+    "Bash(git stash *)",
+    "Bash(git merge *)",
+    "Bash(git checkout *)",
+    "Bash(git switch *)",
+    "Bash(git tag *)",
+    // File read
+    "Bash(ls *)",
+    "Bash(find *)",
+    "Bash(grep *)",
+    "Bash(cat *)",
+    "Bash(head *)",
+    "Bash(tail *)",
+    "Bash(file *)",
+    "Bash(which *)",
+    "Bash(wc *)",
+    "Bash(stat *)",
+    "Bash(du *)",
+    "Bash(df *)",
+    // File write non-destructive
+    "Bash(mkdir *)",
+    "Bash(cp *)",
+    "Bash(mv *)",
+    "Bash(touch *)",
+    // System probing
+    "Bash(ps *)",
+    "Bash(lsof *)",
+    "Bash(env *)",
+    "Bash(printenv *)",
+    "Bash(pwd)",
+    "Bash(echo *)",
+    "Bash(whoami)",
+    "Bash(uname *)",
+    "Bash(id *)",
+    "Bash(date *)",
+    // Text processing
+    "Bash(sed *)",
+    "Bash(awk *)",
+    "Bash(sort *)",
+    "Bash(uniq *)",
+    "Bash(diff *)",
+    "Bash(jq *)",
+    "Bash(tee *)",
+    "Bash(xargs *)",
+    // Mise-managed toolchains
+    "Bash(cargo *)",
+    "Bash(rustc *)",
+    "Bash(npm *)",
+    "Bash(npx *)",
+    "Bash(yarn *)",
+    "Bash(pnpm *)",
+    "Bash(bun *)",
+    "Bash(node *)",
+    "Bash(ruby *)",
+    "Bash(bundle *)",
+    "Bash(rails *)",
+    "Bash(rake *)",
+    "Bash(gem *)",
+    "Bash(go *)",
+    "Bash(python *)",
+    "Bash(pip *)",
+    "Bash(mix *)",
+    "Bash(elixir *)",
+    "Bash(iex *)",
+    "Bash(erl *)",
+    "Bash(zig *)",
+    "Bash(mise *)",
+    // Build tools
+    "Bash(make *)",
+    "Bash(cmake *)",
+    "Bash(docker compose *)",
+    "Bash(docker ps *)",
+    "Bash(docker logs *)",
+    "Bash(docker images *)",
+    // CLI tools
+    "Bash(gh *)",
+    "Bash(curl *)",
+    // Version/help probing
+    "Bash(* --version)",
+    "Bash(* --help)",
+    // Web research
+    "WebSearch",
+    "WebFetch",
+];
+
+const DENY: &[&str] = &[
+    "Bash(rm -rf *)",
+    "Bash(rm -r *)",
+    "Bash(sudo *)",
+    "Bash(chmod 777 *)",
+    "Bash(git reset --hard *)",
+    "Bash(git clean *)",
+    "Bash(git push --force *)",
+    "Bash(git push -f *)",
+    "Bash(docker rm *)",
+    "Bash(docker rmi *)",
+    "Bash(docker system prune *)",
+];
+
+const ASK: &[&str] = &[
+    "Bash(git push *)",
+    "Bash(git rebase *)",
+    "Bash(git branch -D *)",
+    "Bash(git branch -d *)",
+    "Bash(rm *)",
+    "Bash(kamal *)",
+    "Bash(docker run *)",
+    "Bash(docker exec *)",
+    "Bash(docker stop *)",
+];
+
+// ── Public entry point ───────────────────────────────────────────
+
+pub fn run(verbose: bool) -> Result<(), String> {
+    output::info("Bootstrapping AI tool configs...");
+
+    bootstrap_claude(verbose)?;
+    bootstrap_codex(verbose)?;
+    bootstrap_opencode(verbose)?;
+    bootstrap_crush(verbose)?;
+
+    output::ok("Bootstrap complete");
+    Ok(())
+}
+
+// ── Backup ───────────────────────────────────────────────────────
+
+fn backup_file(path: &Path) -> Result<bool, String> {
+    if !path.exists() {
+        return Ok(false);
+    }
+    let mut bak = path.as_os_str().to_owned();
+    bak.push(".bak");
+    let bak_path = PathBuf::from(bak);
+    fs::copy(path, &bak_path).map_err(|e| format!("Failed to backup {}: {e}", path.display()))?;
+    Ok(true)
+}
+
+// ── Claude ───────────────────────────────────────────────────────
+
+fn claude_config_path() -> PathBuf {
+    let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".into());
+    PathBuf::from(home).join(".claude").join("settings.json")
+}
+
+fn build_claude_permissions() -> serde_json::Value {
+    let allow: Vec<serde_json::Value> = ALLOW.iter().map(|s| serde_json::Value::String(s.to_string())).collect();
+    let deny: Vec<serde_json::Value> = DENY.iter().map(|s| serde_json::Value::String(s.to_string())).collect();
+    let ask: Vec<serde_json::Value> = ASK.iter().map(|s| serde_json::Value::String(s.to_string())).collect();
+
+    serde_json::json!({
+        "allow": allow,
+        "deny": deny,
+        "ask": ask,
+        "defaultMode": "acceptEdits"
+    })
+}
+
+fn bootstrap_claude(verbose: bool) -> Result<(), String> {
+    let path = claude_config_path();
+
+    let mut root = if path.exists() {
+        let content = fs::read_to_string(&path)
+            .map_err(|e| format!("Failed to read {}: {e}", path.display()))?;
+        serde_json::from_str::<serde_json::Value>(&content)
+            .map_err(|e| format!("Failed to parse {}: {e}", path.display()))?
+    } else {
+        // Ensure parent dir exists
+        if let Some(parent) = path.parent() {
+            let _ = fs::create_dir_all(parent);
+        }
+        serde_json::json!({})
+    };
+
+    if backup_file(&path)? && verbose {
+        output::verbose(&format!("Backed up {}", path.display()));
+    }
+
+    let obj = root.as_object_mut().ok_or("Claude config is not a JSON object")?;
+    obj.insert("permissions".to_string(), build_claude_permissions());
+
+    let pretty = serde_json::to_string_pretty(&root)
+        .map_err(|e| format!("Failed to serialize Claude config: {e}"))?;
+    fs::write(&path, pretty.as_bytes())
+        .map_err(|e| format!("Failed to write {}: {e}", path.display()))?;
+
+    output::ok(&format!("Claude: {}", path.display()));
+    Ok(())
+}
+
+// ── Codex ────────────────────────────────────────────────────────
+
+fn codex_config_path() -> PathBuf {
+    let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".into());
+    PathBuf::from(home).join(".codex").join("config.toml")
+}
+
+fn bootstrap_codex(verbose: bool) -> Result<(), String> {
+    let path = codex_config_path();
+
+    let mut root = if path.exists() {
+        let content = fs::read_to_string(&path)
+            .map_err(|e| format!("Failed to read {}: {e}", path.display()))?;
+        content
+            .parse::<toml::Value>()
+            .map_err(|e| format!("Failed to parse {}: {e}", path.display()))?
+    } else {
+        if let Some(parent) = path.parent() {
+            let _ = fs::create_dir_all(parent);
+        }
+        toml::Value::Table(toml::map::Map::new())
+    };
+
+    if backup_file(&path)? && verbose {
+        output::verbose(&format!("Backed up {}", path.display()));
+    }
+
+    let table = root
+        .as_table_mut()
+        .ok_or("Codex config is not a TOML table")?;
+    table.insert(
+        "approval_policy".to_string(),
+        toml::Value::String("on-request".to_string()),
+    );
+
+    let content = toml::to_string_pretty(&root)
+        .map_err(|e| format!("Failed to serialize Codex config: {e}"))?;
+    fs::write(&path, content.as_bytes())
+        .map_err(|e| format!("Failed to write {}: {e}", path.display()))?;
+
+    output::ok(&format!("Codex: {}", path.display()));
+    Ok(())
+}
+
+// ── OpenCode ─────────────────────────────────────────────────────
+
+fn opencode_config_path() -> PathBuf {
+    let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".into());
+    PathBuf::from(home)
+        .join(".config")
+        .join("opencode")
+        .join("opencode.json")
+}
+
+fn build_opencode_permissions() -> serde_json::Value {
+    serde_json::json!({
+        "bash": "allow",
+        "edit": "allow",
+        "write": "allow"
+    })
+}
+
+fn bootstrap_opencode(verbose: bool) -> Result<(), String> {
+    let path = opencode_config_path();
+
+    let mut root = if path.exists() {
+        let content = fs::read_to_string(&path)
+            .map_err(|e| format!("Failed to read {}: {e}", path.display()))?;
+        serde_json::from_str::<serde_json::Value>(&content)
+            .map_err(|e| format!("Failed to parse {}: {e}", path.display()))?
+    } else {
+        if let Some(parent) = path.parent() {
+            let _ = fs::create_dir_all(parent);
+        }
+        serde_json::json!({})
+    };
+
+    if backup_file(&path)? && verbose {
+        output::verbose(&format!("Backed up {}", path.display()));
+    }
+
+    let obj = root
+        .as_object_mut()
+        .ok_or("OpenCode config is not a JSON object")?;
+    obj.insert("permission".to_string(), build_opencode_permissions());
+
+    let pretty = serde_json::to_string_pretty(&root)
+        .map_err(|e| format!("Failed to serialize OpenCode config: {e}"))?;
+    fs::write(&path, pretty.as_bytes())
+        .map_err(|e| format!("Failed to write {}: {e}", path.display()))?;
+
+    output::ok(&format!("OpenCode: {}", path.display()));
+    Ok(())
+}
+
+// ── Crush ────────────────────────────────────────────────────────
+
+fn crush_config_path() -> PathBuf {
+    let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".into());
+    PathBuf::from(home)
+        .join(".config")
+        .join("crush")
+        .join("crush.json")
+}
+
+fn bootstrap_crush(verbose: bool) -> Result<(), String> {
+    let path = crush_config_path();
+
+    if path.exists() {
+        if backup_file(&path)? && verbose {
+            output::verbose(&format!("Backed up {}", path.display()));
+        }
+        output::info(&format!(
+            "Crush: no per-command permissions — ai-jail's sandbox is the security layer ({})",
+            path.display()
+        ));
+    } else {
+        output::info("Crush: no config found, skipping (ai-jail's sandbox is the security layer)");
+    }
+
+    Ok(())
+}
+
+// ── Tests ────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::env;
+    use std::fs;
+
+    use std::sync::atomic::{AtomicU32, Ordering};
+    static TEST_COUNTER: AtomicU32 = AtomicU32::new(0);
+
+    fn test_dir() -> PathBuf {
+        let n = TEST_COUNTER.fetch_add(1, Ordering::Relaxed);
+        let dir = env::temp_dir().join(format!(
+            "ai-jail-bootstrap-test-{}-{}",
+            std::process::id(),
+            n
+        ));
+        let _ = fs::create_dir_all(&dir);
+        dir
+    }
+
+    // ── Permission list sanity ──────────────────────────────────
+
+    #[test]
+    fn deny_does_not_overlap_allow() {
+        for d in DENY {
+            assert!(
+                !ALLOW.contains(d),
+                "deny entry {d:?} also appears in allow list"
+            );
+        }
+    }
+
+    #[test]
+    fn ask_does_not_overlap_deny() {
+        for a in ASK {
+            assert!(
+                !DENY.contains(a),
+                "ask entry {a:?} also appears in deny list"
+            );
+        }
+    }
+
+    #[test]
+    fn ask_does_not_overlap_allow() {
+        for a in ASK {
+            assert!(
+                !ALLOW.contains(a),
+                "ask entry {a:?} also appears in allow list"
+            );
+        }
+    }
+
+    // ── Backup ──────────────────────────────────────────────────
+
+    #[test]
+    fn backup_creates_bak_file() {
+        let dir = test_dir();
+        let file = dir.join("test.json");
+        fs::write(&file, b"original").unwrap();
+
+        let backed_up = backup_file(&file).unwrap();
+        assert!(backed_up);
+
+        let bak = dir.join("test.json.bak");
+        assert!(bak.exists());
+        assert_eq!(fs::read_to_string(&bak).unwrap(), "original");
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn backup_overwrites_existing_bak() {
+        let dir = test_dir();
+        let file = dir.join("test.json");
+        let bak = dir.join("test.json.bak");
+
+        fs::write(&file, b"v1").unwrap();
+        fs::write(&bak, b"old-backup").unwrap();
+
+        backup_file(&file).unwrap();
+        assert_eq!(fs::read_to_string(&bak).unwrap(), "v1");
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn backup_returns_false_for_missing_file() {
+        let dir = test_dir();
+        let file = dir.join("nonexistent.json");
+        let backed_up = backup_file(&file).unwrap();
+        assert!(!backed_up);
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    // ── Claude permissions JSON ─────────────────────────────────
+
+    #[test]
+    fn claude_permissions_roundtrip() {
+        let perms = build_claude_permissions();
+        let obj = perms.as_object().unwrap();
+
+        assert!(obj.contains_key("allow"));
+        assert!(obj.contains_key("deny"));
+        assert!(obj.contains_key("ask"));
+        assert_eq!(obj["defaultMode"], "acceptEdits");
+
+        let allow = obj["allow"].as_array().unwrap();
+        assert!(allow.iter().any(|v| v == "Bash(git status *)"));
+        assert!(allow.iter().any(|v| v == "WebSearch"));
+
+        let deny = obj["deny"].as_array().unwrap();
+        assert!(deny.iter().any(|v| v == "Bash(rm -rf *)"));
+        assert!(deny.iter().any(|v| v == "Bash(sudo *)"));
+
+        let ask = obj["ask"].as_array().unwrap();
+        assert!(ask.iter().any(|v| v == "Bash(git push *)"));
+        assert!(ask.iter().any(|v| v == "Bash(rm *)"));
+    }
+
+    #[test]
+    fn claude_merge_preserves_existing_keys() {
+        let dir = test_dir();
+        let claude_dir = dir.join(".claude");
+        fs::create_dir_all(&claude_dir).unwrap();
+        let path = claude_dir.join("settings.json");
+
+        // Write existing config with enabledPlugins
+        let existing = serde_json::json!({
+            "enabledPlugins": {
+                "rust-analyzer-lsp@claude-plugins-official": true
+            },
+            "alwaysThinkingEnabled": true,
+            "permissions": {
+                "allow": ["Bash(echo old)"],
+                "deny": [],
+                "ask": []
+            }
+        });
+        fs::write(&path, serde_json::to_string_pretty(&existing).unwrap()).unwrap();
+
+        // Simulate merge
+        let content = fs::read_to_string(&path).unwrap();
+        let mut root: serde_json::Value = serde_json::from_str(&content).unwrap();
+        root.as_object_mut()
+            .unwrap()
+            .insert("permissions".to_string(), build_claude_permissions());
+
+        let result = root.as_object().unwrap();
+
+        // Permissions replaced
+        let allow = result["permissions"]["allow"].as_array().unwrap();
+        assert!(allow.iter().any(|v| v == "Bash(git status *)"));
+        assert!(!allow.iter().any(|v| v == "Bash(echo old)"));
+
+        // Other keys preserved
+        assert!(result.contains_key("enabledPlugins"));
+        assert_eq!(result["alwaysThinkingEnabled"], true);
+        assert_eq!(
+            result["enabledPlugins"]["rust-analyzer-lsp@claude-plugins-official"],
+            true
+        );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    // ── Codex TOML merge ────────────────────────────────────────
+
+    #[test]
+    fn codex_merge_preserves_existing_keys() {
+        let dir = test_dir();
+        let codex_dir = dir.join(".codex");
+        fs::create_dir_all(&codex_dir).unwrap();
+        let path = codex_dir.join("config.toml");
+
+        let existing = r#"
+model = "o3"
+model_reasoning_effort = "high"
+
+[projects.my-app]
+sandbox_mode = "full"
+"#;
+        fs::write(&path, existing).unwrap();
+
+        let content = fs::read_to_string(&path).unwrap();
+        let mut root: toml::Value = content.parse().unwrap();
+        root.as_table_mut().unwrap().insert(
+            "approval_policy".to_string(),
+            toml::Value::String("on-request".to_string()),
+        );
+
+        let table = root.as_table().unwrap();
+        assert_eq!(
+            table["approval_policy"].as_str().unwrap(),
+            "on-request"
+        );
+        assert_eq!(table["model"].as_str().unwrap(), "o3");
+        assert_eq!(
+            table["model_reasoning_effort"].as_str().unwrap(),
+            "high"
+        );
+        assert!(table.contains_key("projects"));
+        assert!(table["projects"]
+            .as_table()
+            .unwrap()
+            .contains_key("my-app"));
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    // ── OpenCode JSON merge ─────────────────────────────────────
+
+    #[test]
+    fn opencode_merge_preserves_existing_keys() {
+        let dir = test_dir();
+        let oc_dir = dir.join(".config").join("opencode");
+        fs::create_dir_all(&oc_dir).unwrap();
+        let path = oc_dir.join("opencode.json");
+
+        let existing = serde_json::json!({
+            "provider": "anthropic",
+            "theme": "dark",
+            "mcpServers": {
+                "local": { "command": "mcp-server" }
+            }
+        });
+        fs::write(&path, serde_json::to_string_pretty(&existing).unwrap()).unwrap();
+
+        let content = fs::read_to_string(&path).unwrap();
+        let mut root: serde_json::Value = serde_json::from_str(&content).unwrap();
+        root.as_object_mut()
+            .unwrap()
+            .insert("permission".to_string(), build_opencode_permissions());
+
+        let result = root.as_object().unwrap();
+
+        // Permission added
+        assert_eq!(result["permission"]["bash"], "allow");
+        assert_eq!(result["permission"]["edit"], "allow");
+        assert_eq!(result["permission"]["write"], "allow");
+
+        // Other keys preserved
+        assert_eq!(result["provider"], "anthropic");
+        assert_eq!(result["theme"], "dark");
+        assert!(result.contains_key("mcpServers"));
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+}

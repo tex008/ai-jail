@@ -16,6 +16,7 @@ COMMANDS (positional):
 OPTIONS:
     --rw-map <PATH>         Mount PATH read-write inside sandbox (repeatable)
     --map <PATH>            Mount PATH read-only inside sandbox (repeatable)
+    --lockdown / --no-lockdown Enable/disable strict read-only lockdown mode
     --no-gpu / --gpu        Disable/enable GPU device passthrough (Linux only)
     --no-docker / --docker  Disable/enable Docker socket passthrough
     --no-display / --display Disable/enable X11/Wayland passthrough (Linux only)
@@ -23,6 +24,7 @@ OPTIONS:
     --clean                 Ignore existing .ai-jail config, start fresh
     --dry-run               Print the sandbox command without executing
     --init                  Create/update .ai-jail config and exit
+    --bootstrap             Generate smart permission configs for AI tools
     -v, --verbose           Show detailed mount info
     -h, --help              Show help
     -V, --version           Show version
@@ -33,6 +35,7 @@ pub struct CliArgs {
     pub command: Vec<String>,
     pub rw_maps: Vec<PathBuf>,
     pub ro_maps: Vec<PathBuf>,
+    pub lockdown: Option<bool>,
     pub gpu: Option<bool>,
     pub docker: Option<bool>,
     pub display: Option<bool>,
@@ -40,6 +43,7 @@ pub struct CliArgs {
     pub clean: bool,
     pub dry_run: bool,
     pub init: bool,
+    pub bootstrap: bool,
     pub verbose: bool,
     pub status: bool,
 }
@@ -63,6 +67,8 @@ pub fn parse_from(mut parser: lexopt::Parser) -> Result<CliArgs, String> {
                 let val: PathBuf = parser.value().map_err(|e| e.to_string())?.into();
                 args.ro_maps.push(val);
             }
+            Long("lockdown") => args.lockdown = Some(true),
+            Long("no-lockdown") => args.lockdown = Some(false),
             Long("gpu") => args.gpu = Some(true),
             Long("no-gpu") => args.gpu = Some(false),
             Long("docker") => args.docker = Some(true),
@@ -74,6 +80,7 @@ pub fn parse_from(mut parser: lexopt::Parser) -> Result<CliArgs, String> {
             Long("clean") => args.clean = true,
             Long("dry-run") => args.dry_run = true,
             Long("init") => args.init = true,
+            Long("bootstrap") => args.bootstrap = true,
             Short('v') | Long("verbose") => args.verbose = true,
             Short('h') | Long("help") => {
                 print!("{HELP}");
@@ -119,6 +126,7 @@ mod tests {
     fn parse_no_args() {
         let args = parse_test(&[]).unwrap();
         assert!(args.command.is_empty());
+        assert_eq!(args.lockdown, None);
         assert!(!args.dry_run);
         assert!(!args.init);
         assert!(!args.verbose);
@@ -191,6 +199,18 @@ mod tests {
     fn parse_no_gpu() {
         let args = parse_test(&["--no-gpu", "bash"]).unwrap();
         assert_eq!(args.gpu, Some(false));
+    }
+
+    #[test]
+    fn parse_lockdown() {
+        let args = parse_test(&["--lockdown", "bash"]).unwrap();
+        assert_eq!(args.lockdown, Some(true));
+    }
+
+    #[test]
+    fn parse_no_lockdown() {
+        let args = parse_test(&["--no-lockdown", "bash"]).unwrap();
+        assert_eq!(args.lockdown, Some(false));
     }
 
     #[test]
@@ -283,6 +303,22 @@ mod tests {
         assert!(args.clean);
         assert!(args.init);
         assert_eq!(args.command, vec!["bash"]);
+    }
+
+    // ── Error cases ────────────────────────────────────────────
+
+    #[test]
+    fn parse_bootstrap() {
+        let args = parse_test(&["--bootstrap"]).unwrap();
+        assert!(args.bootstrap);
+        assert!(args.command.is_empty());
+    }
+
+    #[test]
+    fn parse_bootstrap_with_verbose() {
+        let args = parse_test(&["--bootstrap", "-v"]).unwrap();
+        assert!(args.bootstrap);
+        assert!(args.verbose);
     }
 
     // ── Error cases ────────────────────────────────────────────

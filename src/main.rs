@@ -1,3 +1,4 @@
+mod bootstrap;
 mod cli;
 mod config;
 mod output;
@@ -26,6 +27,12 @@ fn run() -> Result<i32, String> {
     if cli.init {
         config::save(&config);
         output::info("Config saved to .ai-jail");
+        return Ok(0);
+    }
+
+    // Handle --bootstrap: generate AI tool configs and exit
+    if cli.bootstrap {
+        bootstrap::run(cli.verbose)?;
         return Ok(0);
     }
 
