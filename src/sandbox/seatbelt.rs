@@ -284,7 +284,6 @@ fn macos_read_deny_paths() -> Vec<PathBuf> {
         .collect();
 
     candidates.extend([
-        home.join("Library/Keychains"),
         home.join("Library/Mail"),
         home.join("Library/Messages"),
         home.join("Library/Safari"),
