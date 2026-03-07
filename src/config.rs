@@ -53,7 +53,7 @@ impl Config {
         self.no_landlock != Some(true)
     }
     pub fn status_bar_enabled(&self) -> bool {
-        self.no_status_bar == Some(false)
+        self.no_status_bar != Some(true)
     }
     pub fn status_bar_style(&self) -> &str {
         match self.status_bar_style.as_deref() {
@@ -173,14 +173,6 @@ pub fn save_global(config: &Config) {
     }
     if config.status_bar_style.is_some() {
         global.status_bar_style = config.status_bar_style.clone();
-    }
-    // Persist the effective default theme on first status-bar enable so
-    // future runs keep the same style without extra flags.
-    if config.no_status_bar == Some(false)
-        && config.status_bar_style.is_none()
-        && global.status_bar_style.is_none()
-    {
-        global.status_bar_style = Some(config.status_bar_style().to_string());
     }
     save_to_path(&path, &global);
 }
@@ -363,7 +355,11 @@ pub fn display_status(config: &Config) {
     bool_opt("Mise", config.no_mise);
     bool_opt("Landlock", config.no_landlock);
     bool_opt("Lockdown", config.lockdown.map(|v| !v));
-    bool_opt("Status bar", config.no_status_bar);
+    match config.no_status_bar {
+        Some(true) => output::status_header("  Status bar", "disabled"),
+        Some(false) => output::status_header("  Status bar", "enabled"),
+        None => output::status_header("  Status bar", "enabled (default)"),
+    }
     if config.status_bar_enabled() {
         output::status_header("  Style", config.status_bar_style());
     }
@@ -524,7 +520,7 @@ lockdown = false
     #[test]
     fn regression_v0_4_5_config_without_no_status_bar() {
         // v0.4.5 configs don't have no_status_bar field.
-        // They must still parse and default to status bar disabled.
+        // They must still parse and default to status bar enabled.
         let toml = r#"
 command = ["claude"]
 rw_maps = []
@@ -536,7 +532,7 @@ no_landlock = false
 "#;
         let cfg = parse_toml(toml).unwrap();
         assert_eq!(cfg.no_status_bar, None);
-        assert!(!cfg.status_bar_enabled());
+        assert!(cfg.status_bar_enabled());
     }
 
     #[test]
@@ -897,8 +893,8 @@ no_landlock = false
 
     #[test]
     fn status_bar_enabled_accessor() {
-        // Default OFF: None means disabled
-        assert!(!Config {
+        // Default ON: None means enabled
+        assert!(Config {
             no_status_bar: None,
             ..Config::default()
         }
@@ -924,14 +920,15 @@ no_landlock = false
             ..Config::default()
         };
 
-        // --status-bar sets no_status_bar to false (enabled)
+        // --status-bar only changes style
         let cli = CliArgs {
-            status_bar: Some(true),
+            status_bar_style: Some("light".into()),
             ..CliArgs::default()
         };
         let merged = merge(&cli, existing.clone());
-        assert_eq!(merged.no_status_bar, Some(false));
+        assert_eq!(merged.no_status_bar, None);
         assert!(merged.status_bar_enabled());
+        assert_eq!(merged.status_bar_style.as_deref(), Some("light"));
 
         // --no-status-bar sets no_status_bar to true (disabled)
         let cli = CliArgs {
@@ -946,7 +943,7 @@ no_landlock = false
     // ── File I/O tests (using temp dirs) ───────────────────────
 
     #[test]
-    fn save_global_enabling_status_bar_persists_default_dark_style() {
+    fn save_global_status_bar_theme_persists() {
         let _env = ENV_LOCK.lock().unwrap();
         let home = std::env::temp_dir()
             .join(format!("ai-jail-home-global-{}", std::process::id()));
@@ -954,14 +951,14 @@ no_landlock = false
         unsafe { std::env::set_var("HOME", &home) };
 
         let cfg = Config {
-            no_status_bar: Some(false),
-            status_bar_style: None,
+            no_status_bar: None,
+            status_bar_style: Some("dark".into()),
             ..Config::default()
         };
         save_global(&cfg);
 
         let global = load_global();
-        assert_eq!(global.no_status_bar, Some(false));
+        assert_eq!(global.no_status_bar, None);
         assert_eq!(global.status_bar_style.as_deref(), Some("dark"));
 
         unsafe { std::env::remove_var("HOME") };
@@ -970,7 +967,7 @@ no_landlock = false
     }
 
     #[test]
-    fn save_global_preserves_existing_theme_if_reenabling_without_style() {
+    fn save_global_theme_does_not_reenable_disabled_status_bar() {
         let _env = ENV_LOCK.lock().unwrap();
         let home = std::env::temp_dir().join(format!(
             "ai-jail-home-global-preserve-{}",
@@ -988,15 +985,15 @@ no_landlock = false
         save_to_path(&path, &existing);
 
         let cfg = Config {
-            no_status_bar: Some(false),
-            status_bar_style: None,
+            no_status_bar: None,
+            status_bar_style: Some("dark".into()),
             ..Config::default()
         };
         save_global(&cfg);
 
         let global = load_global();
-        assert_eq!(global.no_status_bar, Some(false));
-        assert_eq!(global.status_bar_style.as_deref(), Some("light"));
+        assert_eq!(global.no_status_bar, Some(true));
+        assert_eq!(global.status_bar_style.as_deref(), Some("dark"));
 
         unsafe { std::env::remove_var("HOME") };
         let _ = std::fs::remove_file(home.join(".ai-jail"));

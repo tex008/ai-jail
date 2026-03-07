@@ -1,7 +1,6 @@
 use crate::config::Config;
 use crate::output;
 use std::fs::OpenOptions;
-use std::io::IsTerminal;
 use std::io::Write;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
@@ -111,7 +110,6 @@ impl MountSet {
         project_dir: &Path,
         lockdown: bool,
     ) -> Vec<String> {
-        let use_new_session = should_use_new_session(lockdown);
         let mut args = vec![
             "--chdir".into(),
             project_dir.display().to_string(),
@@ -123,7 +121,7 @@ impl MountSet {
             "ai-sandbox".into(),
         ];
 
-        if use_new_session {
+        if should_use_new_session() {
             args.push("--new-session".into());
         }
 
@@ -286,11 +284,8 @@ pub(crate) fn bwrap_binary_path() -> Result<PathBuf, String> {
     Err(msg)
 }
 
-fn should_use_new_session(lockdown: bool) -> bool {
-    if lockdown {
-        return true;
-    }
-    !std::io::stdin().is_terminal()
+fn should_use_new_session() -> bool {
+    true
 }
 
 fn bwrap_program_for_exec() -> PathBuf {
@@ -427,12 +422,73 @@ fn new_resolv_file() -> (Option<PathBuf>, Option<PathBuf>) {
     }
 }
 
+fn resolve_landlock_wrapper(
+    config: &Config,
+) -> Result<Option<PathBuf>, String> {
+    if !config.landlock_enabled() {
+        return Ok(None);
+    }
+
+    match self_binary_path() {
+        Some(path) => Ok(Some(path)),
+        None if config.lockdown_enabled() => Err(
+            "Cannot resolve ai-jail binary for inner Landlock wrapper in lockdown mode"
+                .into(),
+        ),
+        None => Ok(None),
+    }
+}
+
+fn landlock_wrapper_args(config: &Config, verbose: bool) -> Vec<String> {
+    let mut args = vec![
+        LANDLOCK_WRAPPER_DEST.into(),
+        "--landlock-exec".into(),
+        "--landlock".into(),
+    ];
+
+    if config.lockdown_enabled() {
+        args.push("--lockdown".into());
+    }
+
+    args.push(if config.gpu_enabled() {
+        "--gpu".into()
+    } else {
+        "--no-gpu".into()
+    });
+    args.push(if config.docker_enabled() {
+        "--docker".into()
+    } else {
+        "--no-docker".into()
+    });
+    args.push(if config.display_enabled() {
+        "--display".into()
+    } else {
+        "--no-display".into()
+    });
+
+    for path in &config.rw_maps {
+        args.push("--rw-map".into());
+        args.push(path.display().to_string());
+    }
+    for path in &config.ro_maps {
+        args.push("--map".into());
+        args.push(path.display().to_string());
+    }
+
+    if verbose {
+        args.push("--verbose".into());
+    }
+
+    args.push("--".into());
+    args
+}
+
 pub fn build(
     guard: &SandboxGuard,
     config: &Config,
     project_dir: &Path,
     verbose: bool,
-) -> Command {
+) -> Result<Command, String> {
     let mount_set = discover_mounts(
         config,
         project_dir,
@@ -446,11 +502,7 @@ pub fn build(
 
     // Landlock wrapper: bind-mount ai-jail into /tmp inside the
     // sandbox so it can apply Landlock after bwrap namespace setup.
-    let wrapper = if config.landlock_enabled() {
-        self_binary_path()
-    } else {
-        None
-    };
+    let wrapper = resolve_landlock_wrapper(config)?;
 
     let mut cmd = Command::new(bwrap);
 
@@ -460,9 +512,9 @@ pub fn build(
 
     // Self binary mount for Landlock wrapper (after all other
     // mounts so /tmp tmpfs already exists)
-    if wrapper.is_some() {
+    if let Some(ref wrapper_path) = wrapper {
         let m = Mount::FileRoBind {
-            src: wrapper.clone().unwrap(),
+            src: wrapper_path.clone(),
             dest: PathBuf::from(LANDLOCK_WRAPPER_DEST),
         };
         for arg in m.to_args() {
@@ -477,15 +529,9 @@ pub fn build(
     cmd.arg("--");
 
     if wrapper.is_some() {
-        cmd.arg(LANDLOCK_WRAPPER_DEST);
-        cmd.arg("--landlock-exec");
-        if lockdown {
-            cmd.arg("--lockdown");
+        for arg in landlock_wrapper_args(config, verbose) {
+            cmd.arg(arg);
         }
-        if verbose {
-            cmd.arg("--verbose");
-        }
-        cmd.arg("--");
     }
 
     cmd.arg(&launch.program);
@@ -493,7 +539,7 @@ pub fn build(
         cmd.arg(arg);
     }
 
-    cmd
+    Ok(cmd)
 }
 
 pub fn dry_run(
@@ -501,15 +547,15 @@ pub fn dry_run(
     config: &Config,
     project_dir: &Path,
     verbose: bool,
-) -> String {
+) -> Result<String, String> {
     let args = build_dry_run_args(
         config,
         project_dir,
         guard.hosts_path(),
         guard.resolv_mount(),
         verbose,
-    );
-    format_dry_run_args(&args)
+    )?;
+    Ok(format_dry_run_args(&args))
 }
 
 fn build_dry_run_args(
@@ -518,7 +564,7 @@ fn build_dry_run_args(
     hosts_file: &Path,
     resolv_mount: Option<(&Path, &Path)>,
     verbose: bool,
-) -> Vec<String> {
+) -> Result<Vec<String>, String> {
     let mount_set =
         discover_mounts(config, project_dir, hosts_file, resolv_mount, verbose);
     let lockdown = config.lockdown_enabled();
@@ -529,11 +575,7 @@ fn build_dry_run_args(
     args.extend(mount_set.all_mount_args());
 
     // Self binary mount for Landlock wrapper
-    let wrapper = if config.landlock_enabled() {
-        self_binary_path()
-    } else {
-        None
-    };
+    let wrapper = resolve_landlock_wrapper(config)?;
     if let Some(ref self_bin) = wrapper {
         let m = Mount::FileRoBind {
             src: self_bin.clone(),
@@ -547,21 +589,13 @@ fn build_dry_run_args(
     args.push("--".into());
 
     if wrapper.is_some() {
-        args.push(LANDLOCK_WRAPPER_DEST.into());
-        args.push("--landlock-exec".into());
-        if lockdown {
-            args.push("--lockdown".into());
-        }
-        if verbose {
-            args.push("--verbose".into());
-        }
-        args.push("--".into());
+        args.extend(landlock_wrapper_args(config, verbose));
     }
 
     args.push(launch.program);
     args.extend(launch.args);
 
-    args
+    Ok(args)
 }
 
 fn quote_arg(arg: &str) -> String {
@@ -1074,7 +1108,8 @@ mod tests {
             guard.hosts_path(),
             guard.resolv_mount(),
             false,
-        );
+        )
+        .unwrap();
         let sep = args.iter().position(|a| a == "--");
         assert!(sep.is_some(), "dry-run args must include -- separator");
     }
@@ -1092,17 +1127,14 @@ mod tests {
             guard.hosts_path(),
             guard.resolv_mount(),
             false,
-        );
+        )
+        .unwrap();
 
         assert!(args.contains(&"--die-with-parent".to_string()));
         assert!(args.contains(&"--unshare-pid".to_string()));
         assert!(args.contains(&"--unshare-uts".to_string()));
         assert!(args.contains(&"--unshare-ipc".to_string()));
-        assert_eq!(
-            args.contains(&"--new-session".to_string()),
-            should_use_new_session(false),
-            "new-session presence should follow tty/lockdown policy",
-        );
+        assert!(args.contains(&"--new-session".to_string()));
     }
 
     #[test]
@@ -1119,7 +1151,8 @@ mod tests {
             guard.hosts_path(),
             guard.resolv_mount(),
             false,
-        );
+        )
+        .unwrap();
         let has_project_ro = args.windows(3).any(|w| {
             w[0] == "--ro-bind"
                 && w[1] == "/home/user/project"
@@ -1142,7 +1175,8 @@ mod tests {
             guard.hosts_path(),
             guard.resolv_mount(),
             false,
-        );
+        )
+        .unwrap();
 
         assert!(args.contains(&"--unshare-net".to_string()));
         assert!(args.contains(&"--clearenv".to_string()));
@@ -1163,7 +1197,8 @@ mod tests {
             guard.hosts_path(),
             guard.resolv_mount(),
             false,
-        );
+        )
+        .unwrap();
 
         let has_tmp_bind = args
             .windows(3)
@@ -1190,8 +1225,8 @@ mod tests {
     }
 
     #[test]
-    fn lockdown_always_uses_new_session() {
-        assert!(should_use_new_session(true));
+    fn bwrap_always_uses_new_session() {
+        assert!(should_use_new_session());
     }
 
     #[test]
@@ -1213,7 +1248,8 @@ mod tests {
             guard.hosts_path(),
             guard.resolv_mount(),
             false,
-        );
+        )
+        .unwrap();
         assert!(
             args.first().is_some_and(|s| s.starts_with('/')),
             "dry-run must show absolute bwrap path"
@@ -1233,7 +1269,8 @@ mod tests {
             guard.hosts_path(),
             guard.resolv_mount(),
             false,
-        );
+        )
+        .unwrap();
 
         // Should contain the wrapper dest path
         assert!(
@@ -1271,7 +1308,8 @@ mod tests {
             guard.hosts_path(),
             guard.resolv_mount(),
             false,
-        );
+        )
+        .unwrap();
 
         assert!(
             !args.contains(&"--landlock-exec".to_string()),

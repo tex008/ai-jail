@@ -20,12 +20,11 @@ fn run_landlock_exec(cli: &cli::CliArgs) -> Result<i32, String> {
     let project_dir = std::env::current_dir()
         .map_err(|e| format!("Cannot determine current directory: {e}"))?;
 
-    // Load config from .ai-jail in project dir (cwd inside sandbox)
-    let existing = config::load();
-    let config = config::merge(cli, existing);
+    // Use the fully resolved outer policy forwarded via internal args.
+    let config = config::merge(cli, config::Config::default());
 
     // Apply Landlock inside the sandbox (after bwrap namespace setup)
-    sandbox::apply_landlock(&config, &project_dir, cli.verbose);
+    sandbox::apply_landlock(&config, &project_dir, cli.verbose)?;
 
     // Replace this process with the real command
     let err = std::process::Command::new(&cli.command[0])
@@ -98,7 +97,7 @@ fn run() -> Result<i32, String> {
     // Handle dry run
     if cli.dry_run {
         let formatted =
-            sandbox::dry_run(&guard, &config, &project_dir, cli.verbose);
+            sandbox::dry_run(&guard, &config, &project_dir, cli.verbose)?;
         output::dry_run_line(&formatted);
         return Ok(0);
     }
@@ -121,7 +120,9 @@ fn run() -> Result<i32, String> {
                 output::verbose("Status bar: skipped (stdio is not a tty)");
             }
         } else {
-            output::verbose("Status bar: off (use --status-bar)");
+            output::verbose(
+                "Status bar: off (use --no-status-bar to disable globally)",
+            );
         }
     }
     if use_status_bar {
@@ -137,7 +138,7 @@ fn run() -> Result<i32, String> {
     // When Landlock is enabled, the inner command is wrapped with
     // `ai-jail --landlock-exec` so Landlock is applied INSIDE the
     // sandbox after bwrap finishes mount namespace setup.
-    let mut cmd = sandbox::build(&guard, &config, &project_dir, cli.verbose);
+    let mut cmd = sandbox::build(&guard, &config, &project_dir, cli.verbose)?;
 
     let exit_code = if use_status_bar {
         // PTY proxy path: ai-jail owns the real terminal, child

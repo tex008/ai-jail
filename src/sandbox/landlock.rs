@@ -8,37 +8,62 @@ use std::path::{Path, PathBuf};
 
 const ABI_VERSION: ABI = ABI::V3;
 
-pub fn apply(config: &Config, project_dir: &Path, verbose: bool) {
+pub fn apply(
+    config: &Config,
+    project_dir: &Path,
+    verbose: bool,
+) -> Result<(), String> {
     if !config.landlock_enabled() {
+        if config.lockdown_enabled() {
+            return Err("Landlock cannot be disabled in lockdown mode".into());
+        }
         if verbose {
             output::verbose("Landlock: disabled by config/flag");
         }
-        return;
+        return Ok(());
     }
 
     match do_apply(config, project_dir, verbose) {
         Ok(status) => match status {
             RulesetStatus::FullyEnforced => {
                 output::info("Landlock: fully enforced");
+                Ok(())
             }
             RulesetStatus::PartiallyEnforced => {
-                output::info(
-                    "Landlock: partially enforced \
-                     (kernel lacks some features)",
-                );
+                if config.lockdown_enabled() {
+                    Err("Landlock: partially enforced in lockdown mode".into())
+                } else {
+                    output::info(
+                        "Landlock: partially enforced \
+                         (kernel lacks some features)",
+                    );
+                    Ok(())
+                }
             }
             RulesetStatus::NotEnforced => {
-                output::warn(
-                    "Landlock: not enforced \
-                     (kernel too old, bwrap-only)",
-                );
+                if config.lockdown_enabled() {
+                    Err("Landlock: not enforced in lockdown mode \
+                         (kernel too old, bwrap-only)"
+                        .into())
+                } else {
+                    output::warn(
+                        "Landlock: not enforced \
+                         (kernel too old, bwrap-only)",
+                    );
+                    Ok(())
+                }
             }
         },
         Err(e) => {
-            output::warn(&format!(
-                "Landlock: failed to apply ({e}), \
-                 falling back to bwrap-only"
-            ));
+            if config.lockdown_enabled() {
+                Err(format!("Landlock: failed to apply in lockdown mode ({e})"))
+            } else {
+                output::warn(&format!(
+                    "Landlock: failed to apply ({e}), \
+                     falling back to bwrap-only"
+                ));
+                Ok(())
+            }
         }
     }
 }
@@ -353,7 +378,7 @@ mod tests {
             ..Config::default()
         };
         // Should return without error or panic
-        apply(&config, Path::new("/tmp"), false);
+        assert!(apply(&config, Path::new("/tmp"), false).is_ok());
     }
 
     #[test]
@@ -363,7 +388,7 @@ mod tests {
         // On kernels without landlock this prints a warning;
         // on kernels with landlock it enforces rules.
         // Either way it must not panic.
-        apply(&config, Path::new("/tmp"), false);
+        assert!(apply(&config, Path::new("/tmp"), false).is_ok());
     }
 
     #[test]
@@ -372,7 +397,17 @@ mod tests {
             lockdown: Some(true),
             ..Config::default()
         };
-        apply(&config, Path::new("/tmp"), false);
+        let _ = apply(&config, Path::new("/tmp"), false);
+    }
+
+    #[test]
+    fn lockdown_rejects_disabled_landlock() {
+        let config = Config {
+            lockdown: Some(true),
+            no_landlock: Some(true),
+            ..Config::default()
+        };
+        assert!(apply(&config, Path::new("/tmp"), false).is_err());
     }
 
     #[test]

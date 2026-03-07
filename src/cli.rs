@@ -22,7 +22,7 @@ OPTIONS:
     --no-docker / --docker  Disable/enable Docker socket passthrough
     --no-display / --display Disable/enable X11/Wayland passthrough (Linux only)
     --no-mise / --mise      Disable/enable mise integration
-    -s, --status-bar[=light] Enable status line (default: dark, =light for light theme)
+    -s, --status-bar[=light] Set status line theme (default on, dark unless =light)
     --no-status-bar          Disable persistent status line
     --clean                 Ignore existing .ai-jail config, start fresh
     --dry-run               Print the sandbox command without executing
@@ -91,7 +91,6 @@ pub fn parse_from(mut parser: lexopt::Parser) -> Result<CliArgs, String> {
             Long("mise") => args.mise = Some(true),
             Long("no-mise") => args.mise = Some(false),
             Long("status-bar") | Short('s') => {
-                args.status_bar = Some(true);
                 if let Some(val) = parser.optional_value() {
                     let s = val.to_string_lossy();
                     match s.as_ref() {
@@ -105,6 +104,8 @@ pub fn parse_from(mut parser: lexopt::Parser) -> Result<CliArgs, String> {
                             ))
                         }
                     }
+                } else {
+                    args.status_bar_style = Some("dark".into());
                 }
             }
             Long("no-status-bar") => args.status_bar = Some(false),
@@ -435,7 +436,8 @@ mod tests {
     #[test]
     fn parse_status_bar() {
         let args = parse_test(&["--status-bar", "bash"]).unwrap();
-        assert_eq!(args.status_bar, Some(true));
+        assert_eq!(args.status_bar, None);
+        assert_eq!(args.status_bar_style.as_deref(), Some("dark"));
     }
 
     #[test]
@@ -447,21 +449,21 @@ mod tests {
     #[test]
     fn parse_status_bar_short() {
         let args = parse_test(&["-s", "bash"]).unwrap();
-        assert_eq!(args.status_bar, Some(true));
-        assert_eq!(args.status_bar_style, None);
+        assert_eq!(args.status_bar, None);
+        assert_eq!(args.status_bar_style.as_deref(), Some("dark"));
     }
 
     #[test]
     fn parse_status_bar_eq_light() {
         let args = parse_test(&["--status-bar=light", "bash"]).unwrap();
-        assert_eq!(args.status_bar, Some(true));
+        assert_eq!(args.status_bar, None);
         assert_eq!(args.status_bar_style.as_deref(), Some("light"));
     }
 
     #[test]
     fn parse_status_bar_eq_dark() {
         let args = parse_test(&["--status-bar=dark", "bash"]).unwrap();
-        assert_eq!(args.status_bar, Some(true));
+        assert_eq!(args.status_bar, None);
         assert_eq!(args.status_bar_style.as_deref(), Some("dark"));
     }
 

@@ -126,14 +126,19 @@ pub fn build_launch_command(config: &Config) -> LaunchCommand {
     user_cmd
 }
 
-pub fn apply_landlock(config: &Config, project_dir: &Path, verbose: bool) {
+pub fn apply_landlock(
+    config: &Config,
+    project_dir: &Path,
+    verbose: bool,
+) -> Result<(), String> {
     #[cfg(target_os = "linux")]
     {
-        landlock::apply(config, project_dir, verbose);
+        landlock::apply(config, project_dir, verbose)
     }
     #[cfg(not(target_os = "linux"))]
     {
         let _ = (config, project_dir, verbose);
+        Ok(())
     }
 }
 
@@ -178,7 +183,7 @@ pub fn build(
     config: &Config,
     project_dir: &Path,
     verbose: bool,
-) -> Command {
+) -> Result<Command, String> {
     #[cfg(target_os = "linux")]
     {
         bwrap::build(guard, config, project_dir, verbose)
@@ -186,7 +191,7 @@ pub fn build(
     #[cfg(target_os = "macos")]
     {
         let _ = guard;
-        seatbelt::build(config, project_dir, verbose)
+        Ok(seatbelt::build(config, project_dir, verbose))
     }
 }
 
@@ -195,7 +200,7 @@ pub fn dry_run(
     config: &Config,
     project_dir: &Path,
     verbose: bool,
-) -> String {
+) -> Result<String, String> {
     #[cfg(target_os = "linux")]
     {
         bwrap::dry_run(guard, config, project_dir, verbose)
@@ -203,7 +208,7 @@ pub fn dry_run(
     #[cfg(target_os = "macos")]
     {
         let _ = guard;
-        seatbelt::dry_run(config, project_dir, verbose)
+        Ok(seatbelt::dry_run(config, project_dir, verbose))
     }
 }
 

@@ -1,6 +1,6 @@
 //! Persistent terminal status bar using ANSI scroll region.
 //!
-//! Layout: ` /path | command              ai-jail 0.4.5 `
+//! Layout: ` /path | command            ai-jail ⚿ 0.4.5 `
 //!
 //! Redraws are requested via atomics and performed from the PTY
 //! IO loop when the output stream is in a safe boundary.
@@ -11,6 +11,7 @@ static ACTIVE: AtomicBool = AtomicBool::new(false);
 static STYLE_DARK: AtomicBool = AtomicBool::new(true);
 static DIRTY: AtomicBool = AtomicBool::new(false);
 static NEED_CLAMP: AtomicBool = AtomicBool::new(false);
+static LAST_ROWS: AtomicUsize = AtomicUsize::new(0);
 
 const MAX_DIR: usize = 4096;
 static mut DIR_BUF: [u8; MAX_DIR] = [0u8; MAX_DIR];
@@ -28,6 +29,8 @@ const VERSION: &str = env!("CARGO_PKG_VERSION");
 const ELLIPSIS: [u8; 3] = [0xe2, 0x80, 0xa6];
 // U+2191 UPWARDS ARROW: 3 UTF-8 bytes, 1 visible column
 const UP_ARROW: [u8; 3] = [0xe2, 0x86, 0x91];
+// U+26BF SQUARED KEY: 3 UTF-8 bytes, 1 visible column
+const JAIL_ICON: [u8; 3] = [0xe2, 0x9a, 0xbf];
 
 fn term_size() -> Option<(u16, u16)> {
     let mut ws = unsafe { std::mem::zeroed::<nix::libc::winsize>() };
@@ -83,6 +86,16 @@ fn write_u16(n: u16, buf: &mut [u8]) -> usize {
     len
 }
 
+fn write_move_clear_row(row: u16, buf: &mut [u8], pos: &mut usize) {
+    buf[*pos..*pos + 2].copy_from_slice(b"\x1b[");
+    *pos += 2;
+    *pos += write_u16(row, &mut buf[*pos..]);
+    buf[*pos..*pos + 3].copy_from_slice(b";1H");
+    *pos += 3;
+    buf[*pos..*pos + 4].copy_from_slice(b"\x1b[2K");
+    *pos += 4;
+}
+
 /// Set up the status bar. Call before spawning the child.
 /// `style` must be `"dark"` or `"light"`.
 pub fn setup(project_dir: &std::path::Path, command: &[String], style: &str) {
@@ -128,6 +141,7 @@ pub fn setup(project_dir: &std::path::Path, command: &[String], style: &str) {
     ACTIVE.store(true, Ordering::SeqCst);
     DIRTY.store(false, Ordering::SeqCst);
     NEED_CLAMP.store(false, Ordering::SeqCst);
+    LAST_ROWS.store(rows as usize, Ordering::SeqCst);
     draw(rows, cols);
 
     // Ensure cursor is within the scroll region.
@@ -234,6 +248,7 @@ pub fn teardown() {
     ACTIVE.store(false, Ordering::SeqCst);
     DIRTY.store(false, Ordering::SeqCst);
     NEED_CLAMP.store(false, Ordering::SeqCst);
+    let last_rows = LAST_ROWS.swap(0, Ordering::SeqCst) as u16;
 
     let rows = term_size().map(|(r, _)| r).unwrap_or(24);
 
@@ -242,15 +257,10 @@ pub fn teardown() {
 
     buf[pos..pos + 3].copy_from_slice(b"\x1b[r");
     pos += 3;
-    buf[pos] = b'\x1b';
-    pos += 1;
-    buf[pos] = b'[';
-    pos += 1;
-    pos += write_u16(rows, &mut buf[pos..]);
-    buf[pos..pos + 3].copy_from_slice(b";1H");
-    pos += 3;
-    buf[pos..pos + 4].copy_from_slice(b"\x1b[2K");
-    pos += 4;
+    if last_rows > 0 && last_rows != rows {
+        write_move_clear_row(last_rows, &mut buf, &mut pos);
+    }
+    write_move_clear_row(rows, &mut buf, &mut pos);
 
     raw_write(&buf[..pos]);
 }
@@ -276,6 +286,8 @@ fn draw(rows: u16, cols: u16) {
     let has_update = UPDATE_AVAILABLE.load(Ordering::SeqCst);
     let dark = STYLE_DARK.load(Ordering::SeqCst);
     let cols = cols as usize;
+    let usable_cols = cols.saturating_sub(1);
+    let last_rows = LAST_ROWS.swap(rows as usize, Ordering::SeqCst) as u16;
 
     let mut buf = [0u8; 8192];
     let mut pos = 0;
@@ -292,6 +304,11 @@ fn draw(rows: u16, cols: u16) {
     // 1. Save cursor
     put!(b"\x1b7");
 
+    // Clear the previous status row if the terminal height changed.
+    if last_rows > 0 && last_rows != rows {
+        write_move_clear_row(last_rows, &mut buf, &mut pos);
+    }
+
     // 2. Set scroll region: \x1b[1;{rows-1}r
     put!(b"\x1b[1;");
     pos += write_u16(rows - 1, &mut buf[pos..]);
@@ -301,6 +318,7 @@ fn draw(rows: u16, cols: u16) {
     put!(b"\x1b[");
     pos += write_u16(rows, &mut buf[pos..]);
     put!(b";1H");
+    put!(b"\x1b[2K");
 
     // 4. Style (softer than previous bold variants)
     if dark {
@@ -311,16 +329,18 @@ fn draw(rows: u16, cols: u16) {
 
     // 5. Compute layout widths
     let ver = VERSION.as_bytes();
-    // "ai-jail " (8) + VERSION + optional " ↑" (2)
-    let right_vis = 8 + ver.len() + if has_update { 2 } else { 0 };
-    let show_right = cols >= right_vis + 2;
+    // "ai-jail ⚿ " (10) + VERSION + optional " ↑" (2)
+    let right_vis = 10 + ver.len() + if has_update { 2 } else { 0 };
+    let show_right = usable_cols >= right_vis + 2;
     let eff_right = if show_right { right_vis } else { 0 };
 
-    // Left budget: cols - 1(leading) - eff_right - 1(min gap)
+    // Leave the final terminal column blank to avoid wrap-pending
+    // artifacts when terminals redraw during resize.
+    // Left budget: usable_cols - 1(leading) - eff_right - 1(min gap)
     let left_budget = if show_right {
-        cols.saturating_sub(eff_right + 2)
+        usable_cols.saturating_sub(eff_right + 2)
     } else {
-        cols.saturating_sub(1)
+        usable_cols.saturating_sub(1)
     };
 
     let mut vis = 0;
@@ -404,7 +424,11 @@ fn draw(rows: u16, cols: u16) {
     }
 
     // --- Space fill ---
-    let target = if show_right { cols - eff_right } else { cols };
+    let target = if show_right {
+        usable_cols - eff_right
+    } else {
+        usable_cols
+    };
     while vis < target {
         put!(b" ");
         vis += 1;
@@ -413,8 +437,10 @@ fn draw(rows: u16, cols: u16) {
     // --- Right section ---
     if show_right {
         put!(b"ai-jail ");
+        put!(&JAIL_ICON);
+        put!(b" ");
         put!(ver);
-        vis += 8 + ver.len();
+        vis += 10 + ver.len();
 
         if has_update {
             put!(b" \x1b[32m"); // space + green
@@ -429,7 +455,7 @@ fn draw(rows: u16, cols: u16) {
     }
 
     // Safety fill
-    while vis < cols {
+    while vis < usable_cols {
         put!(b" ");
         vis += 1;
     }
