@@ -42,27 +42,6 @@ pub fn resize_pty() {
     }
 }
 
-/// Forward SIGWINCH to the PTY foreground process group.
-/// Returns true if forwarding was attempted.
-pub fn forward_sigwinch() -> bool {
-    let master = MASTER_FD.load(Ordering::SeqCst);
-    if master < 0 {
-        return false;
-    }
-
-    let mut pgrp: nix::libc::pid_t = 0;
-    let ret =
-        unsafe { nix::libc::ioctl(master, nix::libc::TIOCGPGRP, &mut pgrp) };
-    if ret != 0 || pgrp <= 0 {
-        return false;
-    }
-
-    unsafe {
-        nix::libc::kill(-pgrp, nix::libc::SIGWINCH);
-    }
-    true
-}
-
 fn enter_raw_mode() -> Result<Termios, String> {
     let stdin = std::io::stdin();
     let saved =
@@ -475,10 +454,11 @@ fn flush_statusbar_if_safe(
         *pending_clamp = false;
     }
     *pending_redraw = false;
-    // Forward SIGWINCH AFTER the scroll region is re-established
-    // so the child redraws onto a clean canvas.
+    // Resize the PTY AFTER the scroll region is re-established.
+    // TIOCSWINSZ on the master makes the kernel deliver SIGWINCH
+    // to the child, so it redraws onto the clean canvas.
     if *pending_sigwinch {
-        forward_sigwinch();
+        resize_pty();
         *pending_sigwinch = false;
     }
 }
@@ -529,7 +509,7 @@ fn io_loop(master: &OwnedFd) {
                     }
                     pending_redraw = false;
                     if pending_sigwinch {
-                        forward_sigwinch();
+                        resize_pty();
                         pending_sigwinch = false;
                     }
                 }

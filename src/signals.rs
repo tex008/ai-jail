@@ -10,12 +10,13 @@ pub fn set_child_pid(pid: i32) {
 
 extern "C" fn forward_signal(sig: nix::libc::c_int) {
     if sig == nix::libc::SIGWINCH {
-        // Resize the PTY immediately (async-signal-safe ioctl).
-        crate::pty::resize_pty();
-        // Don't forward SIGWINCH to the child yet — the IO loop
-        // will do it AFTER clearing the screen and re-establishing
-        // the scroll region, so the child redraws onto a clean
-        // canvas.
+        // Don't resize the PTY or forward SIGWINCH here.
+        // TIOCSWINSZ on the master causes the kernel to send
+        // SIGWINCH to the child immediately, which would make the
+        // child redraw before we clear the screen.  The IO loop
+        // will resize the PTY (and thus deliver SIGWINCH) AFTER
+        // clearing the screen and re-establishing the scroll
+        // region.
         crate::statusbar::request_redraw(true, true);
         return;
     }
