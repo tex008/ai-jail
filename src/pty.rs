@@ -1,22 +1,31 @@
-//! PTY proxy for persistent status bar.
+//! PTY proxy with virtual terminal for persistent status bar.
 //!
 //! When the status bar is enabled, ai-jail interposes a PTY between
 //! itself and the sandbox child. The child writes to the PTY slave
-//! while ai-jail owns the real terminal, allowing the status bar to
-//! persist regardless of what the child does (clear, reset, vim, etc).
+//! while ai-jail owns the real terminal. Child output is processed
+//! through a vt100 virtual terminal and diff-rendered to the real
+//! terminal, giving ai-jail full control over screen content.
 //!
-//! All bytes are forwarded verbatim. The only post-processing is
-//! detecting sequences that reset the scroll region (alt screen
-//! switches, RIS, bare DECSTBM reset) and re-asserting the status
-//! bar afterward.
+//! This approach (similar to tmux/screen) eliminates ghost status
+//! bars on resize: the virtual terminal is resized, its content is
+//! re-rendered, and the status bar is redrawn cleanly.
 
 use nix::poll::{poll, PollFd, PollFlags, PollTimeout};
 use nix::sys::termios::{self, SetArg, Termios};
 use std::os::unix::io::{AsRawFd, BorrowedFd, OwnedFd};
-use std::sync::atomic::{AtomicI32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
 
 /// Stored master raw FD for async-signal-safe resize from SIGWINCH.
 static MASTER_FD: AtomicI32 = AtomicI32::new(-1);
+
+/// Set by signal handler; IO loop clears screen + redraws status bar
+/// BEFORE forwarding SIGWINCH to the child, preventing ghost bars.
+static SIGWINCH_PENDING: AtomicBool = AtomicBool::new(false);
+
+/// Mark a SIGWINCH as pending. Called from the signal handler.
+pub fn set_sigwinch_pending() {
+    SIGWINCH_PENDING.store(true, Ordering::SeqCst);
+}
 
 /// Resize the PTY slave to match the real terminal (minus one row
 /// for the status bar). Async-signal-safe: only uses ioctl + atomics.
@@ -39,6 +48,24 @@ pub fn resize_pty() {
     ws.ws_row -= 1;
     unsafe {
         nix::libc::ioctl(master, nix::libc::TIOCSWINSZ, &ws);
+    }
+}
+
+/// Explicitly send SIGWINCH to the PTY foreground process group.
+/// TIOCSWINSZ should do this via the kernel, but bwrap's PID
+/// namespace can prevent delivery. This is the reliable fallback.
+fn forward_sigwinch() {
+    let master = MASTER_FD.load(Ordering::SeqCst);
+    if master < 0 {
+        return;
+    }
+    let mut pgrp: nix::libc::pid_t = 0;
+    let ret =
+        unsafe { nix::libc::ioctl(master, nix::libc::TIOCGPGRP, &mut pgrp) };
+    if ret == 0 && pgrp > 0 {
+        unsafe {
+            nix::libc::kill(-pgrp, nix::libc::SIGWINCH);
+        }
     }
 }
 
@@ -86,453 +113,70 @@ fn set_initial_size(fd: &OwnedFd, rows: u16, cols: u16) {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum ResetEvent {
-    None,
-    Redraw,
-    RedrawAndClamp,
-}
-
-impl ResetEvent {
-    fn merge(self, other: Self) -> Self {
-        match (self, other) {
-            (ResetEvent::RedrawAndClamp, _)
-            | (_, ResetEvent::RedrawAndClamp) => ResetEvent::RedrawAndClamp,
-            (ResetEvent::Redraw, _) | (_, ResetEvent::Redraw) => {
-                ResetEvent::Redraw
-            }
-            _ => ResetEvent::None,
-        }
-    }
-}
-
-#[derive(Clone, Copy)]
-enum ResetScanState {
-    Normal,
-    Esc,
-    Csi,
-    CsiInter,
-}
-
-/// Incremental scanner for sequences that reset scroll region state.
-struct ResetDetector {
-    state: ResetScanState,
-    params: [u8; 64],
-    params_len: usize,
-    params_overflow: bool,
-}
-
-impl ResetDetector {
-    fn new() -> Self {
-        Self {
-            state: ResetScanState::Normal,
-            params: [0u8; 64],
-            params_len: 0,
-            params_overflow: false,
-        }
-    }
-
-    fn push_param(&mut self, b: u8) {
-        if self.params_len < self.params.len() {
-            self.params[self.params_len] = b;
-            self.params_len += 1;
-        } else {
-            self.params_overflow = true;
-        }
-    }
-
-    fn finish_csi(&self, fin: u8) -> ResetEvent {
-        if self.params_overflow {
-            return ResetEvent::None;
-        }
-        let params = &self.params[..self.params_len];
-
-        // Bare DECSTBM reset: \x1b[r or \x1b[;r
-        if fin == b'r' && (params.is_empty() || params == b";") {
-            return ResetEvent::RedrawAndClamp;
-        }
-
-        // Alt-screen modes:
-        //   ...h = enter alt-screen (needs redraw)
-        //   ...l = leave alt-screen (needs redraw + clamp cursor)
-        if (fin == b'h' || fin == b'l') && params.first() == Some(&b'?') {
-            let mut found = false;
-            for part in params[1..].split(|&b| b == b';') {
-                if part == b"1049" || part == b"47" || part == b"1047" {
-                    found = true;
-                    break;
-                }
-            }
-            if found {
-                return if fin == b'l' {
-                    ResetEvent::RedrawAndClamp
-                } else {
-                    ResetEvent::Redraw
-                };
-            }
-        }
-
-        ResetEvent::None
-    }
-
-    /// Scan output bytes, returning the byte offset just past the
-    /// FIRST reset-triggering sequence.  Returns `None` if no reset
-    /// was found.  Only advances the state machine up to (and
-    /// including) the reset byte, so the caller can call again on
-    /// the remainder to find further resets.
-    fn scan_first_reset(&mut self, data: &[u8]) -> Option<usize> {
-        let mut ev = ResetEvent::None;
-        for (i, &b) in data.iter().enumerate() {
-            self.step(b, &mut ev);
-            if !matches!(ev, ResetEvent::None) {
-                return Some(i + 1);
-            }
-        }
-        None
-    }
-
-    fn step(&mut self, b: u8, ev: &mut ResetEvent) {
-        match self.state {
-            ResetScanState::Normal => {
-                if b == 0x1b {
-                    self.state = ResetScanState::Esc;
-                }
-            }
-            ResetScanState::Esc => match b {
-                b'c' => {
-                    *ev = ev.merge(ResetEvent::RedrawAndClamp);
-                    self.state = ResetScanState::Normal;
-                }
-                b'[' => {
-                    self.state = ResetScanState::Csi;
-                    self.params_len = 0;
-                    self.params_overflow = false;
-                }
-                0x20..=0x2f => {}
-                0x1b => {}
-                _ => {
-                    self.state = ResetScanState::Normal;
-                }
-            },
-            ResetScanState::Csi => match b {
-                0x30..=0x3f => self.push_param(b),
-                0x20..=0x2f => self.state = ResetScanState::CsiInter,
-                0x40..=0x7e => {
-                    *ev = ev.merge(self.finish_csi(b));
-                    self.state = ResetScanState::Normal;
-                }
-                0x1b => self.state = ResetScanState::Esc,
-                _ => self.state = ResetScanState::Normal,
-            },
-            ResetScanState::CsiInter => match b {
-                0x20..=0x2f => {}
-                0x40..=0x7e => {
-                    *ev = ev.merge(self.finish_csi(b));
-                    self.state = ResetScanState::Normal;
-                }
-                0x1b => self.state = ResetScanState::Esc,
-                _ => self.state = ResetScanState::Normal,
-            },
-        }
-    }
-}
-
-#[cfg(test)]
-fn contains_scroll_reset(data: &[u8]) -> bool {
-    let mut detector = ResetDetector::new();
-    detector.scan_first_reset(data).is_some()
-}
-
-#[derive(Clone, Copy)]
-enum ControlState {
-    Normal,
-    Esc,
-    Csi,
-    Osc,
-    OscEsc,
-    Dcs,
-    DcsEsc,
-    Apc,
-    ApcEsc,
-    Pm,
-    PmEsc,
-    Sos,
-    SosEsc,
-}
-
-/// Tracks whether it is safe to inject status-bar control bytes:
-/// only when we're at a control-sequence boundary and not mid UTF-8.
-struct StreamState {
-    ctl: ControlState,
-    utf8_cont: u8,
-}
-
-impl StreamState {
-    fn new() -> Self {
-        Self {
-            ctl: ControlState::Normal,
-            utf8_cont: 0,
-        }
-    }
-
-    fn can_inject(&self) -> bool {
-        matches!(self.ctl, ControlState::Normal) && self.utf8_cont == 0
-    }
-
-    fn update_utf8(&mut self, b: u8) {
-        if self.utf8_cont > 0 {
-            if (0x80..=0xbf).contains(&b) {
-                self.utf8_cont -= 1;
-                return;
-            }
-            self.utf8_cont = 0;
-        }
-        self.utf8_cont = match b {
-            0xc2..=0xdf => 1,
-            0xe0..=0xef => 2,
-            0xf0..=0xf4 => 3,
-            _ => 0,
-        };
-    }
-
-    fn update(&mut self, data: &[u8]) {
-        for &b in data {
-            self.ctl = match self.ctl {
-                ControlState::Normal => {
-                    if b == 0x1b {
-                        ControlState::Esc
-                    } else {
-                        self.update_utf8(b);
-                        ControlState::Normal
-                    }
-                }
-                ControlState::Esc => match b {
-                    b'[' => ControlState::Csi,
-                    b']' => ControlState::Osc,
-                    b'P' => ControlState::Dcs,
-                    b'_' => ControlState::Apc,
-                    b'^' => ControlState::Pm,
-                    b'X' => ControlState::Sos,
-                    0x20..=0x2f => ControlState::Esc,
-                    0x1b => ControlState::Esc,
-                    _ => ControlState::Normal,
-                },
-                ControlState::Csi => match b {
-                    0x20..=0x3f => ControlState::Csi,
-                    0x1b => ControlState::Esc,
-                    _ => ControlState::Normal,
-                },
-                // OSC: BEL or ST (ESC \)
-                ControlState::Osc => match b {
-                    0x07 => ControlState::Normal,
-                    0x1b => ControlState::OscEsc,
-                    _ => ControlState::Osc,
-                },
-                ControlState::OscEsc => {
-                    if b == b'\\' {
-                        ControlState::Normal
-                    } else {
-                        ControlState::Osc
-                    }
-                }
-                // DCS/APC/PM/SOS: ST (ESC \)
-                ControlState::Dcs => {
-                    if b == 0x1b {
-                        ControlState::DcsEsc
-                    } else {
-                        ControlState::Dcs
-                    }
-                }
-                ControlState::DcsEsc => {
-                    if b == b'\\' {
-                        ControlState::Normal
-                    } else {
-                        ControlState::Dcs
-                    }
-                }
-                ControlState::Apc => {
-                    if b == 0x1b {
-                        ControlState::ApcEsc
-                    } else {
-                        ControlState::Apc
-                    }
-                }
-                ControlState::ApcEsc => {
-                    if b == b'\\' {
-                        ControlState::Normal
-                    } else {
-                        ControlState::Apc
-                    }
-                }
-                ControlState::Pm => {
-                    if b == 0x1b {
-                        ControlState::PmEsc
-                    } else {
-                        ControlState::Pm
-                    }
-                }
-                ControlState::PmEsc => {
-                    if b == b'\\' {
-                        ControlState::Normal
-                    } else {
-                        ControlState::Pm
-                    }
-                }
-                ControlState::Sos => {
-                    if b == 0x1b {
-                        ControlState::SosEsc
-                    } else {
-                        ControlState::Sos
-                    }
-                }
-                ControlState::SosEsc => {
-                    if b == b'\\' {
-                        ControlState::Normal
-                    } else {
-                        ControlState::Sos
-                    }
-                }
-            };
-        }
-    }
-}
-
-/// Forward a chunk of child output to stdout, splitting at any
-/// scroll-region-resetting sequence so the status bar is
-/// re-established before subsequent bytes reach the terminal.
-fn forward_child_chunk(
-    data: &[u8],
-    reset: &mut ResetDetector,
-    stream: &mut StreamState,
-    pending_redraw: &mut bool,
-    pending_clamp: &mut bool,
-) {
-    let mut remaining = data;
-    loop {
-        match reset.scan_first_reset(remaining) {
-            None => {
-                // No (more) resets — write the rest and return.
-                write_all_raw(nix::libc::STDOUT_FILENO, remaining);
-                stream.update(remaining);
-                *pending_redraw = true;
-                return;
-            }
-            Some(split) => {
-                // Write bytes up to and including the reset
-                // sequence, then re-establish the scroll region
-                // before the next bytes reach the terminal.
-                write_all_raw(nix::libc::STDOUT_FILENO, &remaining[..split]);
-                stream.update(&remaining[..split]);
-                *pending_clamp = true;
-                crate::statusbar::redraw();
-                crate::statusbar::clamp_cursor();
-                *pending_clamp = false;
-                *pending_redraw = false;
-
-                remaining = &remaining[split..];
-                if remaining.is_empty() {
-                    return;
-                }
-                // Loop to handle further resets in the same chunk.
-            }
-        }
-    }
-}
-
-fn flush_statusbar_if_safe(
-    stream: &StreamState,
-    pending_redraw: &mut bool,
-    pending_clamp: &mut bool,
-    pending_resize: &mut bool,
-) {
-    if !*pending_redraw || !stream.can_inject() {
-        return;
-    }
-    crate::statusbar::redraw();
-    if *pending_clamp {
-        crate::statusbar::clamp_cursor();
-        *pending_clamp = false;
-    }
-    *pending_redraw = false;
-    // Resize the PTY AFTER the scroll region is correct.
-    // TIOCSWINSZ makes the kernel deliver SIGWINCH to the
-    // child, which then redraws onto the correctly set up
-    // terminal — matching the tmux/mtm approach.
-    if *pending_resize {
-        resize_pty();
-        *pending_resize = false;
-    }
-}
-
-fn io_loop(master: &OwnedFd) {
+fn io_loop(master: &OwnedFd, init_rows: u16, init_cols: u16) {
     let stdin_fd = std::io::stdin().as_raw_fd();
     let master_raw = master.as_raw_fd();
     let stdin_bfd = unsafe { BorrowedFd::borrow_raw(stdin_fd) };
     let master_bfd = unsafe { BorrowedFd::borrow_raw(master_raw) };
     let mut buf = [0u8; 8192];
-    let mut stream = StreamState::new();
-    let mut reset = ResetDetector::new();
+
+    // Virtual terminal: rows-1 to leave room for status bar.
+    // No scrollback needed — the real terminal handles that via
+    // the diff-rendered output we send to stdout.
+    let mut parser = vt100::Parser::new(init_rows - 1, init_cols, 0);
+    let mut prev_screen = parser.screen().clone();
     let mut pending_redraw = false;
-    let mut pending_clamp = false;
-    let mut pending_resize = false;
 
     loop {
+        // Handle pending SIGWINCH before anything else.
+        // Order matters: resize vt100 FIRST, then resize PTY.
+        // TIOCSWINSZ on the master makes the kernel deliver
+        // SIGWINCH to the child, so we must ensure the virtual
+        // terminal is already at the new size before the child
+        // starts redrawing.
+        if SIGWINCH_PENDING.swap(false, Ordering::SeqCst) {
+            let (rows, cols) =
+                real_term_size().unwrap_or((init_rows, init_cols));
+            if rows >= 2 {
+                // 1. Resize virtual terminal
+                parser.screen_mut().set_size(rows - 1, cols);
+
+                // 2. Clear real terminal and render current
+                //    vt100 content at the new size.
+                let stdout = nix::libc::STDOUT_FILENO;
+                write_all_raw(stdout, b"\x1b[H\x1b[J");
+                let screen = parser.screen();
+                let output = screen.state_formatted();
+                write_all_raw(stdout, &output);
+                prev_screen = screen.clone();
+
+                // 3. Redraw status bar on last row
+                crate::statusbar::redraw();
+
+                // 4. NOW resize PTY and explicitly forward
+                //    SIGWINCH to the child process group.
+                resize_pty();
+                forward_sigwinch();
+
+                let _ = crate::statusbar::take_requests();
+                pending_redraw = false;
+            }
+        }
+
         let mut fds = [
             PollFd::new(stdin_bfd, PollFlags::POLLIN),
             PollFd::new(master_bfd, PollFlags::POLLIN),
         ];
 
-        let (req_redraw, req_clamp) = crate::statusbar::take_requests();
-        if req_redraw {
+        if crate::statusbar::take_requests() {
             pending_redraw = true;
-        }
-        if req_clamp {
-            pending_clamp = true;
-            pending_redraw = true;
-            // clamp is only requested on SIGWINCH, which means
-            // the real terminal changed size.  Resize the PTY
-            // after the status bar redraw sets the correct
-            // scroll region — not before.
-            pending_resize = true;
-        }
-
-        // If a redraw is pending and the stream is at a safe
-        // boundary, flush immediately instead of waiting for
-        // poll().  This is critical for SIGWINCH: the signal
-        // handler does NOT call resize_pty(), so the child
-        // hasn't been notified yet.  We must set the correct
-        // scroll region and THEN resize the PTY so the child
-        // redraws onto a properly prepared terminal.
-        if pending_redraw && stream.can_inject() {
-            crate::statusbar::redraw();
-            if pending_clamp {
-                crate::statusbar::clamp_cursor();
-                pending_clamp = false;
-            }
-            pending_redraw = false;
-            if pending_resize {
-                resize_pty();
-                pending_resize = false;
-            }
         }
 
         match poll(&mut fds, PollTimeout::from(100_u16)) {
             Ok(0) => {
-                // Timeout: if a redraw is pending, force it
-                // regardless of stream state. After 100ms of
-                // silence any partial escape sequence is stale.
                 if pending_redraw {
-                    stream = StreamState::new();
                     crate::statusbar::redraw();
-                    if pending_clamp {
-                        crate::statusbar::clamp_cursor();
-                        pending_clamp = false;
-                    }
                     pending_redraw = false;
-                    if pending_resize {
-                        resize_pty();
-                        pending_resize = false;
-                    }
                 }
                 continue;
             }
@@ -547,13 +191,12 @@ fn io_loop(master: &OwnedFd) {
                 match nix::unistd::read(master_raw, &mut buf) {
                     Ok(0) => break,
                     Ok(n) => {
-                        forward_child_chunk(
-                            &buf[..n],
-                            &mut reset,
-                            &mut stream,
-                            &mut pending_redraw,
-                            &mut pending_clamp,
-                        );
+                        parser.process(&buf[..n]);
+                        let screen = parser.screen();
+                        let diff = screen.state_diff(&prev_screen);
+                        write_all_raw(nix::libc::STDOUT_FILENO, &diff);
+                        prev_screen = screen.clone();
+                        pending_redraw = true;
                     }
                     Err(nix::errno::Errno::EINTR) => {}
                     Err(nix::errno::Errno::EIO) => break,
@@ -567,39 +210,29 @@ fn io_loop(master: &OwnedFd) {
                     match nix::unistd::read(master_raw, &mut buf) {
                         Ok(0) | Err(_) => break,
                         Ok(n) => {
-                            forward_child_chunk(
-                                &buf[..n],
-                                &mut reset,
-                                &mut stream,
-                                &mut pending_redraw,
-                                &mut pending_clamp,
-                            );
+                            parser.process(&buf[..n]);
                         }
                     }
                 }
-                flush_statusbar_if_safe(
-                    &stream,
-                    &mut pending_redraw,
-                    &mut pending_clamp,
-                    &mut pending_resize,
-                );
+                let screen = parser.screen();
+                let diff = screen.state_diff(&prev_screen);
+                write_all_raw(nix::libc::STDOUT_FILENO, &diff);
+                crate::statusbar::redraw();
                 break;
             }
         }
 
-        // If child is currently quiet and we're at a safe stream boundary,
-        // apply any pending redraw now.
-        if !matches!(fds[1].revents(), Some(r) if r.contains(PollFlags::POLLIN))
+        // Redraw status bar when child is quiet
+        if !matches!(
+            fds[1].revents(),
+            Some(r) if r.contains(PollFlags::POLLIN)
+        ) && pending_redraw
         {
-            flush_statusbar_if_safe(
-                &stream,
-                &mut pending_redraw,
-                &mut pending_clamp,
-                &mut pending_resize,
-            );
+            crate::statusbar::redraw();
+            pending_redraw = false;
         }
 
-        // Check stdin (user input)
+        // Check stdin (user input) — forward directly to PTY
         if let Some(revents) = fds[0].revents() {
             if revents.contains(PollFlags::POLLIN) {
                 match nix::unistd::read(stdin_fd, &mut buf) {
@@ -634,9 +267,10 @@ fn write_all_raw(fd: i32, data: &[u8]) {
     }
 }
 
-/// Run the command through a PTY proxy. Creates PTY pair, enters
-/// raw mode, spawns child with PTY slave as stdio, runs IO loop,
-/// waits for child, restores terminal. Returns exit code.
+/// Run the command through a PTY proxy with virtual terminal.
+/// Creates PTY pair, enters raw mode, spawns child with PTY slave
+/// as stdio, runs IO loop with vt100 diff-rendering, waits for
+/// child, restores terminal. Returns exit code.
 pub fn run(cmd: &mut std::process::Command) -> Result<i32, String> {
     use std::os::unix::process::CommandExt;
 
@@ -707,7 +341,7 @@ pub fn run(cmd: &mut std::process::Command) -> Result<i32, String> {
     drop(slave);
 
     // Run IO loop (blocks until child exits / master HUP)
-    io_loop(&master);
+    io_loop(&master, rows, cols);
 
     // Clean up
     MASTER_FD.store(-1, Ordering::SeqCst);
@@ -741,150 +375,79 @@ fn real_term_size() -> Option<(u16, u16)> {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-
     #[test]
-    fn detect_bare_decstbm_reset() {
-        assert!(contains_scroll_reset(b"\x1b[r"));
+    fn vt100_screen_tracks_content() {
+        let mut parser = vt100::Parser::new(24, 80, 0);
+        parser.process(b"Hello, world!");
+        let screen = parser.screen();
+        let row = screen.rows(0, 80).next().unwrap();
+        assert!(row.starts_with("Hello, world!"));
     }
 
     #[test]
-    fn detect_semicolon_decstbm_reset() {
-        assert!(contains_scroll_reset(b"\x1b[;r"));
+    fn vt100_diff_produces_output() {
+        let mut parser = vt100::Parser::new(24, 80, 0);
+        let prev = parser.screen().clone();
+        parser.process(b"test output");
+        let diff = parser.screen().contents_diff(&prev);
+        assert!(!diff.is_empty());
     }
 
     #[test]
-    fn ignore_parameterized_decstbm() {
-        assert!(!contains_scroll_reset(b"\x1b[1;24r"));
+    fn vt100_resize_preserves_content() {
+        let mut parser = vt100::Parser::new(24, 80, 0);
+        parser.process(b"line1\r\nline2\r\nline3");
+        parser.screen_mut().set_size(30, 100);
+        let screen = parser.screen();
+        let row0 = screen.rows(0, 100).next().unwrap();
+        assert!(row0.starts_with("line1"));
     }
 
     #[test]
-    fn detect_ris() {
-        assert!(contains_scroll_reset(b"\x1bc"));
+    fn vt100_state_diff_includes_mode_changes() {
+        let mut parser = vt100::Parser::new(24, 80, 0);
+        let prev = parser.screen().clone();
+        // Enable bracketed paste mode
+        parser.process(b"\x1b[?2004h");
+        let diff = parser.screen().state_diff(&prev);
+        // state_diff includes both content and mode changes
+        assert!(parser.screen().bracketed_paste());
+        assert!(!prev.bracketed_paste());
+        // Diff should contain the mode change sequence
+        assert!(!diff.is_empty());
     }
 
     #[test]
-    fn detect_alt_screen_1049h() {
-        assert!(contains_scroll_reset(b"\x1b[?1049h"));
+    fn vt100_alt_screen_tracking() {
+        let mut parser = vt100::Parser::new(24, 80, 0);
+        assert!(!parser.screen().alternate_screen());
+        parser.process(b"\x1b[?1049h");
+        assert!(parser.screen().alternate_screen());
+        parser.process(b"\x1b[?1049l");
+        assert!(!parser.screen().alternate_screen());
     }
 
     #[test]
-    fn detect_alt_screen_1049l() {
-        assert!(contains_scroll_reset(b"\x1b[?1049l"));
-    }
-
-    #[test]
-    fn detect_alt_screen_47h() {
-        assert!(contains_scroll_reset(b"\x1b[?47h"));
-    }
-
-    #[test]
-    fn detect_alt_screen_1047l() {
-        assert!(contains_scroll_reset(b"\x1b[?1047l"));
-    }
-
-    #[test]
-    fn ignore_show_cursor() {
-        assert!(!contains_scroll_reset(b"\x1b[?25h"));
-    }
-
-    #[test]
-    fn ignore_sgr_color() {
-        assert!(!contains_scroll_reset(b"\x1b[38;2;255;100;0m"));
-    }
-
-    #[test]
-    fn ignore_clear_screen() {
-        assert!(!contains_scroll_reset(b"\x1b[2J"));
-    }
-
-    #[test]
-    fn detect_embedded_in_output() {
-        let data = b"hello\x1b[?1049hworld";
-        assert!(contains_scroll_reset(data));
-    }
-
-    #[test]
-    fn no_false_positive_plain_text() {
-        assert!(!contains_scroll_reset(b"just plain text\n"));
-    }
-
-    #[test]
-    fn detect_alt_screen_combined_modes() {
-        // Some programs set multiple modes at once
-        assert!(contains_scroll_reset(b"\x1b[?1049;2004h"));
-    }
-
-    #[test]
-    fn detect_split_alt_screen_exit_across_chunks() {
-        let mut detector = ResetDetector::new();
-        assert!(detector.scan_first_reset(b"\x1b[?1049").is_none());
-        assert!(detector.scan_first_reset(b"l").is_some());
-    }
-
-    #[test]
-    fn scan_first_reset_returns_split_offset() {
-        let mut detector = ResetDetector::new();
-        // \x1b[r is 3 bytes; data after it should be at offset 3
-        let data = b"\x1b[rHello";
-        assert_eq!(detector.scan_first_reset(data), Some(3));
-    }
-
-    #[test]
-    fn scan_first_reset_embedded_in_output() {
-        let mut detector = ResetDetector::new();
-        let data = b"prefix\x1b[rsuffix";
-        // "prefix" (6) + "\x1b[r" (3) = offset 9
-        assert_eq!(detector.scan_first_reset(data), Some(9));
-    }
-
-    #[test]
-    fn scan_first_reset_none_for_clean_data() {
-        let mut detector = ResetDetector::new();
-        assert!(detector.scan_first_reset(b"just text\n").is_none());
-    }
-
-    #[test]
-    fn scan_first_reset_multiple_resets() {
-        let mut detector = ResetDetector::new();
-        let data = b"\x1b[rABC\x1b[rDEF";
-        // First call: finds first \x1b[r at offset 3
-        assert_eq!(detector.scan_first_reset(data), Some(3));
-        // Call again on remainder to find the second reset
+    fn vt100_mouse_mode_tracking() {
+        let mut parser = vt100::Parser::new(24, 80, 0);
         assert_eq!(
-            detector.scan_first_reset(&data[3..]),
-            Some(6) // "ABC\x1b[r" = 3 + 3 = 6 offset in remainder
+            parser.screen().mouse_protocol_mode(),
+            vt100::MouseProtocolMode::None
         );
-        // Call again on final remainder — no more resets
-        assert!(detector.scan_first_reset(&data[9..]).is_none());
+        parser.process(b"\x1b[?1003h");
+        assert_eq!(
+            parser.screen().mouse_protocol_mode(),
+            vt100::MouseProtocolMode::AnyMotion
+        );
     }
 
     #[test]
-    fn stream_state_blocks_mid_utf8() {
-        let mut s = StreamState::new();
-        s.update(&[0xe2]); // start of 3-byte sequence
-        assert!(!s.can_inject());
-        s.update(&[0x94, 0x80]); // finish "─"
-        assert!(s.can_inject());
-    }
-
-    #[test]
-    fn stream_state_blocks_inside_dcs_until_st() {
-        let mut s = StreamState::new();
-        s.update(b"\x1bP");
-        assert!(!s.can_inject());
-        s.update(b"abc");
-        assert!(!s.can_inject());
-        s.update(b"\x1b\\");
-        assert!(s.can_inject());
-    }
-
-    #[test]
-    fn stream_state_blocks_inside_osc_until_bel() {
-        let mut s = StreamState::new();
-        s.update(b"\x1b]0;title");
-        assert!(!s.can_inject());
-        s.update(&[0x07]);
-        assert!(s.can_inject());
+    fn vt100_cursor_visibility() {
+        let mut parser = vt100::Parser::new(24, 80, 0);
+        assert!(!parser.screen().hide_cursor());
+        parser.process(b"\x1b[?25l");
+        assert!(parser.screen().hide_cursor());
+        parser.process(b"\x1b[?25h");
+        assert!(!parser.screen().hide_cursor());
     }
 }

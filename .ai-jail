@@ -3,9 +3,8 @@
 # Edit freely. Regenerate with: ai-jail --clean --init
 
 command = [
-    "bash",
-    "-lc",
-    "echo NORMAL_OK >/dev/null; echo NORMAL_DONE",
+    "claude",
+    "--continue",
 ]
 rw_maps = [
     "/home/akitaonrails/Projects/homebrew-tap",

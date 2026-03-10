@@ -10,16 +10,11 @@ pub fn set_child_pid(pid: i32) {
 
 extern "C" fn forward_signal(sig: nix::libc::c_int) {
     if sig == nix::libc::SIGWINCH {
-        // Do NOT resize the PTY here.  The IO loop will:
-        //   1. redraw the status bar (correct scroll region)
-        //   2. THEN resize the PTY (child gets SIGWINCH)
-        // This mirrors tmux/mtm: set up terminal state first,
-        // notify child second.
-        //
-        // SIGWINCH is installed WITHOUT SA_RESTART so poll()
-        // returns EINTR immediately and the IO loop processes
-        // the resize without delay.
-        crate::statusbar::request_redraw(true);
+        // Only set flag — the IO loop will resize vt100 FIRST, then
+        // resize the PTY (which delivers SIGWINCH to the child via
+        // kernel TIOCSWINSZ). This ordering ensures vt100 is at the
+        // correct size when the child's redraw output arrives.
+        crate::pty::set_sigwinch_pending();
         return;
     }
 
@@ -32,29 +27,21 @@ extern "C" fn forward_signal(sig: nix::libc::c_int) {
 }
 
 pub fn install_handlers() {
-    // Most signals: SA_RESTART so read/write loops are not
-    // interrupted spuriously.
-    let restart = SigAction::new(
+    let action = SigAction::new(
         SigHandler::Handler(forward_signal),
         SaFlags::SA_RESTART,
         SigSet::empty(),
     );
-    for sig in [Signal::SIGINT, Signal::SIGTERM, Signal::SIGHUP] {
-        unsafe {
-            let _ = signal::sigaction(sig, &restart);
-        }
-    }
 
-    // SIGWINCH: deliberately NO SA_RESTART so that poll()
-    // returns EINTR immediately, letting the IO loop process
-    // the resize without waiting for the 100 ms timeout.
-    let no_restart = SigAction::new(
-        SigHandler::Handler(forward_signal),
-        SaFlags::empty(),
-        SigSet::empty(),
-    );
-    unsafe {
-        let _ = signal::sigaction(Signal::SIGWINCH, &no_restart);
+    for sig in [
+        Signal::SIGINT,
+        Signal::SIGTERM,
+        Signal::SIGHUP,
+        Signal::SIGWINCH,
+    ] {
+        unsafe {
+            let _ = signal::sigaction(sig, &action);
+        }
     }
 }
 

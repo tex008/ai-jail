@@ -1,17 +1,17 @@
-//! Persistent terminal status bar using ANSI scroll region.
+//! Persistent terminal status bar overlay.
 //!
 //! Layout: ` /path | command            ai-jail ⚿ 0.4.5 `
 //!
-//! Redraws are requested via atomics and performed from the PTY
-//! IO loop when the output stream is in a safe boundary.
+//! With the vt100 virtual terminal, the status bar is drawn as a
+//! simple overlay on the real terminal's last row — no scroll
+//! regions needed. The virtual terminal is sized rows-1, so child
+//! output never reaches the last row.
 
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 static ACTIVE: AtomicBool = AtomicBool::new(false);
 static STYLE_DARK: AtomicBool = AtomicBool::new(true);
 static DIRTY: AtomicBool = AtomicBool::new(false);
-static NEED_CLAMP: AtomicBool = AtomicBool::new(false);
-static LAST_ROWS: AtomicUsize = AtomicUsize::new(0);
 
 const MAX_DIR: usize = 4096;
 static mut DIR_BUF: [u8; MAX_DIR] = [0u8; MAX_DIR];
@@ -140,55 +140,28 @@ pub fn setup(project_dir: &std::path::Path, command: &[String], style: &str) {
 
     ACTIVE.store(true, Ordering::SeqCst);
     DIRTY.store(false, Ordering::SeqCst);
-    NEED_CLAMP.store(false, Ordering::SeqCst);
-    LAST_ROWS.store(rows as usize, Ordering::SeqCst);
     draw(rows, cols);
-
-    // Ensure cursor is within the scroll region.
-    clamp_cursor();
 }
 
 /// Signal that a newer version is available. Triggers redraw.
 pub fn set_update_available() {
     UPDATE_AVAILABLE.store(true, Ordering::SeqCst);
-    request_redraw(false);
+    request_redraw();
+}
+
+/// Whether the status bar is currently active.
+pub fn is_active() -> bool {
+    ACTIVE.load(Ordering::SeqCst)
 }
 
 /// Request a redraw from async contexts.
-/// If `clamp` is true, cursor will be clamped after redraw.
-pub fn request_redraw(clamp: bool) {
+pub fn request_redraw() {
     DIRTY.store(true, Ordering::SeqCst);
-    if clamp {
-        NEED_CLAMP.store(true, Ordering::SeqCst);
-    }
 }
 
-/// Consume and clear pending redraw/clamp requests.
-pub fn take_requests() -> (bool, bool) {
-    let redraw = DIRTY.swap(false, Ordering::SeqCst);
-    let clamp = NEED_CLAMP.swap(false, Ordering::SeqCst);
-    (redraw, clamp)
-}
-
-/// Clamp the cursor into the scroll region.
-pub fn clamp_cursor() {
-    if !ACTIVE.load(Ordering::SeqCst) {
-        return;
-    }
-    let Some((rows, _)) = term_size() else {
-        return;
-    };
-    if rows < 2 {
-        return;
-    }
-    let mut cb = [0u8; 16];
-    let mut cp = 0;
-    cb[cp..cp + 2].copy_from_slice(b"\x1b[");
-    cp += 2;
-    cp += write_u16(rows - 1, &mut cb[cp..]);
-    cb[cp..cp + 3].copy_from_slice(b";1H");
-    cp += 3;
-    raw_write(&cb[..cp]);
+/// Consume and clear pending redraw request.
+pub fn take_requests() -> bool {
+    DIRTY.swap(false, Ordering::SeqCst)
 }
 
 /// Spawn a background thread to check GitHub for a newer release.
@@ -247,19 +220,12 @@ pub fn teardown() {
     }
     ACTIVE.store(false, Ordering::SeqCst);
     DIRTY.store(false, Ordering::SeqCst);
-    NEED_CLAMP.store(false, Ordering::SeqCst);
-    let last_rows = LAST_ROWS.swap(0, Ordering::SeqCst) as u16;
 
     let rows = term_size().map(|(r, _)| r).unwrap_or(24);
 
-    let mut buf = [0u8; 64];
+    // Just clear the last row where the status bar was drawn.
+    let mut buf = [0u8; 32];
     let mut pos = 0;
-
-    buf[pos..pos + 3].copy_from_slice(b"\x1b[r");
-    pos += 3;
-    if last_rows > 0 && last_rows != rows {
-        write_move_clear_row(last_rows, &mut buf, &mut pos);
-    }
     write_move_clear_row(rows, &mut buf, &mut pos);
 
     raw_write(&buf[..pos]);
@@ -279,7 +245,7 @@ pub fn redraw() {
     draw(rows, cols);
 }
 
-/// Render scroll region + status line. Async-signal-safe.
+/// Render status bar overlay on the last row. Async-signal-safe.
 fn draw(rows: u16, cols: u16) {
     let dir_len = DIR_LEN.load(Ordering::SeqCst);
     let cmd_len = CMD_LEN.load(Ordering::SeqCst);
@@ -287,7 +253,6 @@ fn draw(rows: u16, cols: u16) {
     let dark = STYLE_DARK.load(Ordering::SeqCst);
     let cols = cols as usize;
     let usable_cols = cols.saturating_sub(1);
-    let last_rows = LAST_ROWS.swap(rows as usize, Ordering::SeqCst) as u16;
 
     let mut buf = [0u8; 8192];
     let mut pos = 0;
@@ -304,20 +269,7 @@ fn draw(rows: u16, cols: u16) {
     // 1. Save cursor
     put!(b"\x1b7");
 
-    // When terminal height changes, clear only the old status bar
-    // row so it doesn't leave a ghost line.  We do NOT clear the
-    // entire screen — the child will repaint its own area when it
-    // receives SIGWINCH from the deferred PTY resize.
-    if last_rows > 0 && last_rows != rows {
-        write_move_clear_row(last_rows, &mut buf, &mut pos);
-    }
-
-    // 2. Set scroll region: \x1b[1;{rows-1}r
-    put!(b"\x1b[1;");
-    pos += write_u16(rows - 1, &mut buf[pos..]);
-    put!(b"r");
-
-    // 3. Move to last row: \x1b[{rows};1H
+    // 2. Move to last row + clear it: \x1b[{rows};1H\x1b[2K
     put!(b"\x1b[");
     pos += write_u16(rows, &mut buf[pos..]);
     put!(b";1H");
@@ -531,11 +483,10 @@ mod tests {
     }
 
     #[test]
-    fn request_redraw_tracks_clamp_flag() {
+    fn request_redraw_sets_dirty() {
         DIRTY.store(false, Ordering::SeqCst);
-        NEED_CLAMP.store(false, Ordering::SeqCst);
-        request_redraw(true);
-        assert_eq!(take_requests(), (true, true));
-        assert_eq!(take_requests(), (false, false));
+        request_redraw();
+        assert!(take_requests());
+        assert!(!take_requests());
     }
 }

@@ -140,8 +140,15 @@ impl MountSet {
                 "HOME".into(),
                 super::home_dir().display().to_string(),
             ]);
-            if let Ok(term) = std::env::var("TERM") {
-                args.extend(["--setenv".into(), "TERM".into(), term]);
+            // Pass through terminal-related env vars so child
+            // programs can detect capabilities (truecolor, kitty
+            // keyboard protocol, etc.).
+            for var in
+                ["TERM", "COLORTERM", "TERM_PROGRAM", "TERM_PROGRAM_VERSION"]
+            {
+                if let Ok(val) = std::env::var(var) {
+                    args.extend(["--setenv".into(), var.into(), val]);
+                }
             }
         } else {
             for (key, val) in &self.display_env {
@@ -284,8 +291,14 @@ pub(crate) fn bwrap_binary_path() -> Result<PathBuf, String> {
     Err(msg)
 }
 
+/// Use --new-session unless the PTY proxy (status bar) is active.
+/// bwrap's --new-session calls setsid() inside the sandbox, which
+/// creates a new session with NO controlling terminal. This prevents
+/// SIGWINCH delivery from the PTY, so the child never redraws on
+/// resize. When the PTY proxy is active, the PTY slave IS the
+/// controlling terminal and already provides session isolation.
 fn should_use_new_session() -> bool {
-    true
+    !crate::statusbar::is_active()
 }
 
 fn bwrap_program_for_exec() -> PathBuf {
@@ -1249,7 +1262,8 @@ mod tests {
     }
 
     #[test]
-    fn bwrap_always_uses_new_session() {
+    fn new_session_when_status_bar_inactive() {
+        // When status bar is not active, --new-session should be used
         assert!(should_use_new_session());
     }
 

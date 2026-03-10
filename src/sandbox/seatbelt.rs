@@ -47,8 +47,14 @@ pub fn build(config: &Config, project_dir: &Path, verbose: bool) -> Command {
             "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
         );
         cmd.env("HOME", super::home_dir());
-        if let Ok(term) = std::env::var("TERM") {
-            cmd.env("TERM", term);
+        // Pass through terminal-related env vars so child
+        // programs can detect capabilities (truecolor, kitty
+        // keyboard protocol, etc.).
+        for var in ["TERM", "COLORTERM", "TERM_PROGRAM", "TERM_PROGRAM_VERSION"]
+        {
+            if let Ok(val) = std::env::var(var) {
+                cmd.env(var, val);
+            }
         }
     }
 
