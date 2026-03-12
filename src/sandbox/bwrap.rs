@@ -293,14 +293,26 @@ pub(crate) fn bwrap_binary_path() -> Result<PathBuf, String> {
     Err(msg)
 }
 
-/// Use --new-session unless the PTY proxy (status bar) is active.
+/// Use --new-session only when stdin is NOT a terminal.
+///
 /// bwrap's --new-session calls setsid() inside the sandbox, which
-/// creates a new session with NO controlling terminal. This prevents
-/// SIGWINCH delivery from the PTY, so the child never redraws on
-/// resize. When the PTY proxy is active, the PTY slave IS the
-/// controlling terminal and already provides session isolation.
+/// creates a new session with NO controlling terminal. This
+/// completely blocks SIGWINCH delivery, so the child never sees
+/// terminal resize events.
+///
+/// When stdin IS a terminal (interactive use), we skip
+/// --new-session so the child stays in the same session and
+/// receives SIGWINCH from the kernel when the terminal is
+/// resized. The PTY proxy (status bar) path already skips
+/// --new-session because the child has its own controlling
+/// terminal (the PTY slave).
+///
+/// --new-session is still used for non-interactive invocations
+/// (piped input, scripts) where SIGWINCH doesn't apply and the
+/// extra session isolation is beneficial.
 fn should_use_new_session() -> bool {
-    !crate::statusbar::is_active()
+    use std::io::IsTerminal;
+    !crate::statusbar::is_active() && !std::io::stdin().is_terminal()
 }
 
 fn bwrap_program_for_exec() -> PathBuf {
@@ -1303,9 +1315,16 @@ mod tests {
     }
 
     #[test]
-    fn new_session_when_status_bar_inactive() {
-        // When status bar is not active, --new-session should be used
-        assert!(should_use_new_session());
+    fn new_session_when_not_interactive() {
+        // --new-session is only used when stdin is not a terminal.
+        // In CI/test environments, stdin is typically NOT a terminal,
+        // so --new-session should be used.
+        use std::io::IsTerminal;
+        if !std::io::stdin().is_terminal() {
+            assert!(should_use_new_session());
+        }
+        // When stdin IS a terminal (interactive use), --new-session
+        // is skipped so the child receives SIGWINCH.
     }
 
     #[test]

@@ -170,20 +170,26 @@ fn io_loop(master: &OwnedFd, init_rows: u16, init_cols: u16) {
                 content_cols = cols;
                 parser.screen_mut().set_size(content_rows, content_cols);
 
+                let screen = parser.screen();
+                let on_alt = screen.alternate_screen();
+
                 // Reset scroll region and clear screen
                 write_all_raw(stdout, b"\x1b[r\x1b[H\x1b[J");
 
-                // Re-establish scroll region for primary screen
-                let screen = parser.screen();
-                if !screen.alternate_screen() {
+                if on_alt {
+                    // Alt screen: re-render from vt100 state
+                    // (child will overwrite with its own redraw)
+                    let output = screen.state_formatted();
+                    write_all_raw(stdout, &output);
+                } else {
+                    // Primary screen: just set scroll region
+                    // and let the child redraw at the new size.
+                    // Don't re-render stale vt100 content.
                     set_scroll_region(stdout, content_rows);
                 }
 
-                // Re-render from vt100 state at new size
-                let output = screen.state_formatted();
-                write_all_raw(stdout, &output);
                 prev_screen = screen.clone();
-                was_alt_screen = screen.alternate_screen();
+                was_alt_screen = on_alt;
 
                 // Redraw status bar, then notify child
                 crate::statusbar::redraw();
@@ -252,11 +258,16 @@ fn io_loop(master: &OwnedFd, init_rows: u16, init_cols: u16) {
                             write_all_raw(stdout, &buf[..n]);
                             // Re-establish scroll region in case
                             // child output contained a reset.
-                            // DECSTBM moves cursor to home, so
-                            // save/restore around it.
-                            write_all_raw(stdout, b"\x1b7");
-                            set_scroll_region(stdout, content_rows);
-                            write_all_raw(stdout, b"\x1b8");
+                            // Only inject when the output ends at
+                            // ground state — if we're mid-escape
+                            // sequence, our injected escapes would
+                            // corrupt the child's incomplete CSI
+                            // (causes color bleeding).
+                            if ends_at_ground_state(&buf[..n]) {
+                                write_all_raw(stdout, b"\x1b7");
+                                set_scroll_region(stdout, content_rows);
+                                write_all_raw(stdout, b"\x1b8");
+                            }
                         }
 
                         prev_screen = screen.clone();
@@ -316,6 +327,50 @@ fn io_loop(master: &OwnedFd, init_rows: u16, init_cols: u16) {
     // Clean up: reset scroll region so terminal is in a
     // known state after ai-jail exits.
     write_all_raw(stdout, b"\x1b[r");
+}
+
+/// Check whether raw output ends at the ground state of the VT
+/// escape parser.  If `false`, the buffer ends mid-sequence and
+/// injecting our own escape codes would corrupt the child's
+/// incomplete CSI/OSC/DCS.
+fn ends_at_ground_state(data: &[u8]) -> bool {
+    // 0 = ground, 1 = ESC, 2 = CSI params, 3 = string (OSC/DCS)
+    let mut st: u8 = 0;
+    for &b in data {
+        st = match st {
+            0 => {
+                if b == 0x1b {
+                    1
+                } else {
+                    0
+                }
+            }
+            1 => match b {
+                b'[' => 2,
+                b']' | b'P' | b'X' | b'^' | b'_' => 3,
+                0x20..=0x2f => 1, // intermediates
+                _ => 0,           // single-char escape done
+            },
+            2 => {
+                if (0x40..=0x7e).contains(&b) {
+                    0 // CSI final byte
+                } else {
+                    2 // params / intermediates
+                }
+            }
+            3 => {
+                if b == 0x07 {
+                    0 // BEL terminates OSC
+                } else if b == 0x1b {
+                    1 // possible ST (ESC \)
+                } else {
+                    3
+                }
+            }
+            _ => 0,
+        };
+    }
+    st == 0
 }
 
 /// Write all bytes to a raw fd using libc::write (works in all
@@ -519,5 +574,59 @@ mod tests {
         assert!(parser.screen().hide_cursor());
         parser.process(b"\x1b[?25h");
         assert!(!parser.screen().hide_cursor());
+    }
+
+    use super::ends_at_ground_state;
+
+    #[test]
+    fn ground_state_plain_text() {
+        assert!(ends_at_ground_state(b"hello world"));
+    }
+
+    #[test]
+    fn ground_state_complete_csi() {
+        // Complete SGR: \x1b[31m
+        assert!(ends_at_ground_state(b"\x1b[31m"));
+        // Complete 24-bit color
+        assert!(ends_at_ground_state(b"\x1b[38;2;255;0;0mRed"));
+    }
+
+    #[test]
+    fn ground_state_incomplete_csi() {
+        // Ends mid-CSI (no final byte yet)
+        assert!(!ends_at_ground_state(b"\x1b[38;2;255"));
+        // Just ESC [
+        assert!(!ends_at_ground_state(b"\x1b["));
+        // Just ESC
+        assert!(!ends_at_ground_state(b"\x1b"));
+    }
+
+    #[test]
+    fn ground_state_text_then_incomplete() {
+        assert!(!ends_at_ground_state(b"hello\x1b[31"));
+    }
+
+    #[test]
+    fn ground_state_osc_complete() {
+        // OSC terminated by BEL
+        assert!(ends_at_ground_state(b"\x1b]0;title\x07"));
+        // OSC terminated by ST (ESC \)
+        assert!(ends_at_ground_state(b"\x1b]0;title\x1b\\"));
+    }
+
+    #[test]
+    fn ground_state_osc_incomplete() {
+        assert!(!ends_at_ground_state(b"\x1b]0;title"));
+    }
+
+    #[test]
+    fn ground_state_empty() {
+        assert!(ends_at_ground_state(b""));
+    }
+
+    #[test]
+    fn ground_state_single_char_escape() {
+        // ESC 7 (DECSC) is a complete single-char escape
+        assert!(ends_at_ground_state(b"\x1b7"));
     }
 }

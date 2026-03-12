@@ -10,10 +10,10 @@ pub fn set_child_pid(pid: i32) {
 
 extern "C" fn forward_signal(sig: nix::libc::c_int) {
     if sig == nix::libc::SIGWINCH {
-        // Only set flag — the IO loop will resize vt100 FIRST, then
-        // resize the PTY (which delivers SIGWINCH to the child via
-        // kernel TIOCSWINSZ). This ordering ensures vt100 is at the
-        // correct size when the child's redraw output arrives.
+        // PTY proxy: defer to IO loop which resizes vt100 first.
+        // No PTY proxy: SIGWINCH reaches the child directly from
+        // the kernel (we don't use --new-session for interactive
+        // terminals, so the child shares the session).
         crate::pty::set_sigwinch_pending();
         return;
     }
@@ -33,15 +33,22 @@ pub fn install_handlers() {
         SigSet::empty(),
     );
 
-    for sig in [
-        Signal::SIGINT,
-        Signal::SIGTERM,
-        Signal::SIGHUP,
-        Signal::SIGWINCH,
-    ] {
+    // SIGWINCH must NOT use SA_RESTART so that poll() returns
+    // EINTR immediately, allowing the IO loop to process the
+    // resize without waiting for the poll timeout.
+    let winch_action = SigAction::new(
+        SigHandler::Handler(forward_signal),
+        SaFlags::empty(),
+        SigSet::empty(),
+    );
+
+    for sig in [Signal::SIGINT, Signal::SIGTERM, Signal::SIGHUP] {
         unsafe {
             let _ = signal::sigaction(sig, &action);
         }
+    }
+    unsafe {
+        let _ = signal::sigaction(Signal::SIGWINCH, &winch_action);
     }
 }
 
