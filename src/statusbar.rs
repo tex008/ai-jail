@@ -29,8 +29,10 @@ const VERSION: &str = env!("CARGO_PKG_VERSION");
 const ELLIPSIS: [u8; 3] = [0xe2, 0x80, 0xa6];
 // U+2191 UPWARDS ARROW: 3 UTF-8 bytes, 1 visible column
 const UP_ARROW: [u8; 3] = [0xe2, 0x86, 0x91];
-// U+26BF SQUARED KEY: 3 UTF-8 bytes, 1 visible column
+// U+26BF SQUARED KEY: 3 UTF-8 bytes, East Asian Width "Ambiguous"
+// Renders as 2 columns on macOS terminals; counted as 2 here.
 const JAIL_ICON: [u8; 3] = [0xe2, 0x9a, 0xbf];
+const JAIL_ICON_COLS: usize = 2;
 
 fn term_size() -> Option<(u16, u16)> {
     let mut ws = unsafe { std::mem::zeroed::<nix::libc::winsize>() };
@@ -284,8 +286,9 @@ fn draw(rows: u16, cols: u16) {
 
     // 5. Compute layout widths
     let ver = VERSION.as_bytes();
-    // "ai-jail ⚿ " (10) + VERSION + optional " ↑" (2)
-    let right_vis = 10 + ver.len() + if has_update { 2 } else { 0 };
+    // "ai-jail " (8) + ⚿ (JAIL_ICON_COLS) + " " (1) + VERSION + optional " ↑" (2)
+    let right_vis =
+        8 + JAIL_ICON_COLS + 1 + ver.len() + if has_update { 2 } else { 0 };
     let show_right = usable_cols >= right_vis + 2;
     let eff_right = if show_right { right_vis } else { 0 };
 
@@ -395,7 +398,7 @@ fn draw(rows: u16, cols: u16) {
         put!(&JAIL_ICON);
         put!(b" ");
         put!(ver);
-        vis += 10 + ver.len();
+        vis += 8 + JAIL_ICON_COLS + 1 + ver.len();
 
         if has_update {
             put!(b" \x1b[32m"); // space + green
