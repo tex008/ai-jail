@@ -284,11 +284,8 @@ fn io_loop(master: &OwnedFd, init_rows: u16, init_cols: u16) {
                                 let (row, col) =
                                     parser.screen().cursor_position();
                                 set_scroll_region(stdout, content_rows);
-                                let seq = format!(
-                                    "\x1b[{};{}H",
-                                    row + 1,
-                                    col + 1
-                                );
+                                let seq =
+                                    format!("\x1b[{};{}H", row + 1, col + 1);
                                 write_all_raw(stdout, seq.as_bytes());
                             }
                         }
