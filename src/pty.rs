@@ -271,10 +271,25 @@ fn io_loop(master: &OwnedFd, init_rows: u16, init_cols: u16) {
                             // sequence, our injected escapes would
                             // corrupt the child's incomplete CSI
                             // (causes color bleeding).
+                            //
+                            // DECSTBM (\x1b[1;Nr) moves the cursor
+                            // to home as a side effect. Restore it
+                            // via absolute CUP (\x1b[row;colH) using
+                            // the position tracked by the vt100
+                            // model — avoids DECSC/DECRC (\x1b7/\x1b8)
+                            // which on macOS terminals also saves/
+                            // restores scroll margins, undoing the
+                            // repair we just applied.
                             if ends_at_ground_state(&buf[..n]) {
-                                write_all_raw(stdout, b"\x1b7");
+                                let (row, col) =
+                                    parser.screen().cursor_position();
                                 set_scroll_region(stdout, content_rows);
-                                write_all_raw(stdout, b"\x1b8");
+                                let seq = format!(
+                                    "\x1b[{};{}H",
+                                    row + 1,
+                                    col + 1
+                                );
+                                write_all_raw(stdout, seq.as_bytes());
                             }
                         }
 
@@ -749,5 +764,23 @@ mod tests {
     fn ground_state_single_char_escape() {
         // ESC 7 (DECSC) is a complete single-char escape
         assert!(ends_at_ground_state(b"\x1b7"));
+    }
+
+    #[test]
+    fn ground_state_scroll_region_reset() {
+        // \x1b[r resets scroll margins — full CSI, ends at ground
+        assert!(ends_at_ground_state(b"\x1b[r"));
+        // Table border followed by scroll region reset
+        assert!(ends_at_ground_state(
+            b"\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\x1b[r"
+        ));
+    }
+
+    #[test]
+    fn ground_state_cup_sequence() {
+        // CUP (\x1b[row;colH) used to restore cursor position
+        // after set_scroll_region — complete CSI, ends at ground.
+        assert!(ends_at_ground_state(b"\x1b[12;1H"));
+        assert!(ends_at_ground_state(b"\x1b[1;80H"));
     }
 }
