@@ -785,23 +785,38 @@ fn discover_base(
     hosts_file: &Path,
     resolv_mount: Option<(&Path, &Path)>,
 ) -> Vec<Mount> {
-    let mut mounts = vec![
-        Mount::RoBind {
-            src: "/usr".into(),
-            dest: "/usr".into(),
-        },
-        Mount::Symlink {
-            src: "usr/bin".into(),
-            dest: "/bin".into(),
-        },
-        Mount::Symlink {
-            src: "usr/lib".into(),
-            dest: "/lib".into(),
-        },
-        Mount::Symlink {
-            src: "usr/lib64".into(),
-            dest: "/lib64".into(),
-        },
+    let mut mounts = vec![Mount::RoBind {
+        src: "/usr".into(),
+        dest: "/usr".into(),
+    }];
+
+    // /bin, /lib, /lib64, /sbin: on merged-/usr distros these are
+    // symlinks to /usr/* and we recreate the symlink inside the
+    // sandbox.  On non-merged distros (e.g. Slackware, older
+    // Debian) they are real directories with cross-symlinks into
+    // /usr; a --symlink would create loops, so we ro-bind them.
+    for (dir, usr_sub) in [
+        ("/bin", "usr/bin"),
+        ("/lib", "usr/lib"),
+        ("/lib64", "usr/lib64"),
+        ("/sbin", "usr/sbin"),
+    ] {
+        let p = Path::new(dir);
+        if p.is_symlink() {
+            mounts.push(Mount::Symlink {
+                src: usr_sub.into(),
+                dest: p.into(),
+            });
+        } else if p.is_dir() {
+            mounts.push(Mount::RoBind {
+                src: p.into(),
+                dest: p.into(),
+            });
+        }
+        // else: does not exist, skip
+    }
+
+    mounts.extend([
         Mount::RoBind {
             src: "/etc".into(),
             dest: "/etc".into(),
@@ -830,7 +845,7 @@ fn discover_base(
         Mount::Tmpfs {
             dest: "/run".into(),
         },
-    ];
+    ]);
 
     // Keep resolv mount after /run tmpfs. On WSL/systemd-resolved
     // `/etc/resolv.conf` often points into `/run`, which must not
