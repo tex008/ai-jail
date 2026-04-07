@@ -307,7 +307,7 @@ lockdown = true
 
 When CLI flags and an existing config are both present:
 
-- `command`: CLI replaces config
+- `command`: CLI replaces config for the current run, but a CLI-passed command is **not** auto-persisted when the project already has a stored command — so `ai-jail codex` after `ai-jail claude` runs codex for that session without rewriting `.ai-jail`'s stored default. Use `ai-jail --init <command>` to explicitly change the stored command. First-run bootstrap (no stored command yet) still persists the CLI command as the new default.
 - `rw_maps` / `ro_maps`: CLI values are appended (duplicates removed)
 - Boolean flags: CLI overrides config (`--no-gpu` sets `no_gpu = true`)
 - Config is updated after merge in normal mode; lockdown skips auto-save
@@ -316,7 +316,7 @@ When CLI flags and an existing config are both present:
 
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
-| `command` | string array | `["bash"]` | Command to run inside sandbox |
+| `command` | string array | `["bash"]` | Default command to run inside sandbox. Set by first run or by `--init`; not overwritten when a different command is passed on the CLI. |
 | `rw_maps` | path array | `[]` | Extra read-write mounts |
 | `ro_maps` | path array | `[]` | Extra read-only mounts |
 | `no_gpu` | bool | not set (auto) | `true` disables GPU passthrough |
