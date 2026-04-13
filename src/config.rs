@@ -83,8 +83,8 @@ impl Config {
     pub fn status_bar_style(&self) -> &str {
         match self.status_bar_style.as_deref() {
             Some("light") => "light",
-            Some("pastel") => "pastel",
-            _ => "dark",
+            Some("dark") => "dark",
+            _ => "pastel",
         }
     }
     pub fn seccomp_enabled(&self) -> bool {

@@ -29,7 +29,7 @@ OPTIONS:
     --pictures / --no-pictures     Share ~/Pictures read-only (default: off)
     --save-config / --no-save-config
                                    Enable/disable automatic .ai-jail writes
-    -s, --status-bar[=STYLE]       Set status line theme (dark | light | pastel; default dark)
+    -s, --status-bar[=STYLE]       Set status line theme (pastel | dark | light; default pastel)
                                    Pastel picks a random pastel palette per session
     --no-status-bar                Disable persistent status line
     --exec                         Direct execution mode (no PTY proxy, no status bar)
@@ -159,7 +159,7 @@ pub fn parse_from(mut parser: lexopt::Parser) -> Result<CliArgs, String> {
                         }
                     }
                 } else {
-                    args.status_bar_style = Some("dark".into());
+                    args.status_bar_style = Some("pastel".into());
                 }
             }
             Long("no-status-bar") => args.status_bar = Some(false),
@@ -631,7 +631,7 @@ mod tests {
     fn parse_status_bar() {
         let args = parse_test(&["--status-bar", "bash"]).unwrap();
         assert_eq!(args.status_bar, None);
-        assert_eq!(args.status_bar_style.as_deref(), Some("dark"));
+        assert_eq!(args.status_bar_style.as_deref(), Some("pastel"));
     }
 
     #[test]
@@ -644,7 +644,7 @@ mod tests {
     fn parse_status_bar_short() {
         let args = parse_test(&["-s", "bash"]).unwrap();
         assert_eq!(args.status_bar, None);
-        assert_eq!(args.status_bar_style.as_deref(), Some("dark"));
+        assert_eq!(args.status_bar_style.as_deref(), Some("pastel"));
     }
 
     #[test]

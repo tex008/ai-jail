@@ -262,7 +262,7 @@ If no command is given and no `.ai-jail` config exists, defaults to `bash`.
 | `--ssh` / `--no-ssh` | Share `~/.ssh` read-only + forward `SSH_AUTH_SOCK` (default: off) |
 | `--pictures` / `--no-pictures` | Share `~/Pictures` read-only (default: off) |
 | `--save-config` / `--no-save-config` | Enable/disable automatic `.ai-jail` writes |
-| `-s`, `--status-bar[=STYLE]` | Enable persistent status line. `STYLE` is `dark` (default), `light`, or `pastel` (random pastel palette per session — use `=dark` / `=light` to switch back) |
+| `-s`, `--status-bar[=STYLE]` | Enable persistent status line. `STYLE` is `pastel` (default, random palette per session), `dark`, or `light` |
 | `--no-status-bar` | Disable persistent status line |
 | `--exec` | Direct execution mode (no PTY proxy, no status bar) |
 | `--clean` | Ignore existing config, start fresh |
