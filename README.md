@@ -317,7 +317,6 @@ command = ["claude"]
 rw_maps = ["/home/user/Projects/shared-lib"]
 ro_maps = []
 no_gpu = true
-no_save_config = true
 lockdown = true
 ```
 
