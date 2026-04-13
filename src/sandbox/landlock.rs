@@ -501,18 +501,18 @@ fn collect_normal_paths(
     // XDG_RUNTIME_DIR. Needed for GUI apps the agent might
     // launch (browsers for testing, display servers for
     // screenshots). Controlled by --no-display.
-    if config.display_enabled() {
-        if let Ok(xdg_dir) = std::env::var("XDG_RUNTIME_DIR") {
-            let xdg_path = PathBuf::from(&xdg_dir);
-            if xdg_path.is_dir() {
-                if verbose {
-                    output::verbose(&format!(
-                        "Landlock: XDG runtime {} rw",
-                        xdg_path.display()
-                    ));
-                }
-                rw.push(xdg_path);
+    if config.display_enabled()
+        && let Ok(xdg_dir) = std::env::var("XDG_RUNTIME_DIR")
+    {
+        let xdg_path = PathBuf::from(&xdg_dir);
+        if xdg_path.is_dir() {
+            if verbose {
+                output::verbose(&format!(
+                    "Landlock: XDG runtime {} rw",
+                    xdg_path.display()
+                ));
             }
+            rw.push(xdg_path);
         }
     }
 

@@ -222,6 +222,7 @@ fn io_loop(
             let (rows, cols) =
                 real_term_size().unwrap_or((init_rows, init_cols));
             if rows >= 2 {
+                let old_content_rows = content_rows;
                 content_rows = rows - 1;
                 content_cols = cols;
                 parser.screen_mut().set_size(content_rows, content_cols);
@@ -229,18 +230,30 @@ fn io_loop(
                 let screen = parser.screen();
                 let on_alt = screen.alternate_screen();
 
-                // Reset scroll region and clear screen
-                write_all_raw(stdout, b"\x1b[r\x1b[H\x1b[J");
-
-                // Repaint the visible content from the vt100 model on
-                // every resize. In the primary screen, many CLIs and
-                // shells do not proactively redraw after SIGWINCH, so
-                // clearing the terminal and waiting for new output
-                // leaves blank holes until more text arrives.
-                let output = screen.state_formatted();
-                write_all_raw(stdout, &output);
-                if !on_alt {
+                if on_alt {
+                    // Alt screen: full clear + repaint from vt100.
+                    // Needed so prev_screen matches the real terminal
+                    // for subsequent state_diff rendering.
+                    write_all_raw(stdout, b"\x1b[r\x1b[H\x1b[J");
+                    let output = screen.state_formatted();
+                    write_all_raw(stdout, &output);
+                } else {
+                    // Primary screen: preserve visible content to
+                    // avoid a blank flash on maximize. Reset the
+                    // scroll region and clean up the old status bar
+                    // ghost, then let the child repaint after
+                    // SIGWINCH.
+                    write_all_raw(stdout, b"\x1b[r");
+                    // Clear old status bar row if still in view
+                    if old_content_rows < content_rows {
+                        let seq =
+                            format!("\x1b[{};1H\x1b[2K", old_content_rows + 1);
+                        write_all_raw(stdout, seq.as_bytes());
+                    }
                     set_scroll_region(stdout, content_rows);
+                    let (row, col) = screen.cursor_position();
+                    let seq = format!("\x1b[{};{}H", row + 1, col + 1);
+                    write_all_raw(stdout, seq.as_bytes());
                 }
 
                 prev_screen = screen.clone();
@@ -252,8 +265,9 @@ fn io_loop(
                 resize_pty();
                 forward_sigwinch();
                 if !on_alt && resize_redraw_key.is_some() {
-                    // Let the child process SIGWINCH first, then nudge
-                    // it to repaint once the terminal has gone quiet.
+                    // Let the child process SIGWINCH first, then
+                    // nudge it to repaint once the terminal is
+                    // quiet.
                     pending_resize_redraw_at =
                         Some(Instant::now() + RESIZE_REDRAW_DELAY);
                 }
@@ -278,13 +292,13 @@ fn io_loop(
                     crate::statusbar::redraw();
                     pending_redraw = false;
                 }
-                if let Some(deadline) = pending_resize_redraw_at {
-                    if Instant::now() >= deadline {
-                        if let Some(key) = resize_redraw_key {
-                            write_all_raw(master_raw, key);
-                        }
-                        pending_resize_redraw_at = None;
+                if let Some(deadline) = pending_resize_redraw_at
+                    && Instant::now() >= deadline
+                {
+                    if let Some(key) = resize_redraw_key {
+                        write_all_raw(master_raw, key);
                     }
+                    pending_resize_redraw_at = None;
                 }
                 continue;
             }
@@ -396,40 +410,37 @@ fn io_loop(
             }
         }
 
-        // Redraw status bar when child is quiet
-        if !matches!(
+        // Redraw status bar / inject resize key when child is quiet
+        let child_quiet = !matches!(
             fds[1].revents(),
             Some(r) if r.contains(PollFlags::POLLIN)
-        ) && pending_redraw
-        {
-            crate::statusbar::redraw();
-            pending_redraw = false;
-        }
-        if !matches!(
-            fds[1].revents(),
-            Some(r) if r.contains(PollFlags::POLLIN)
-        ) {
-            if let Some(deadline) = pending_resize_redraw_at {
-                if Instant::now() >= deadline {
-                    if let Some(key) = resize_redraw_key {
-                        write_all_raw(master_raw, key);
-                    }
-                    pending_resize_redraw_at = None;
+        );
+        if child_quiet {
+            if pending_redraw {
+                crate::statusbar::redraw();
+                pending_redraw = false;
+            }
+            if let Some(deadline) = pending_resize_redraw_at
+                && Instant::now() >= deadline
+            {
+                if let Some(key) = resize_redraw_key {
+                    write_all_raw(master_raw, key);
                 }
+                pending_resize_redraw_at = None;
             }
         }
 
         // Check stdin (user input) — forward directly to PTY
-        if let Some(revents) = fds[0].revents() {
-            if revents.contains(PollFlags::POLLIN) {
-                match nix::unistd::read(stdin_fd, &mut buf) {
-                    Ok(0) => break,
-                    Ok(n) => {
-                        write_all_raw(master_raw, &buf[..n]);
-                    }
-                    Err(nix::errno::Errno::EINTR) => {}
-                    Err(_) => break,
+        if let Some(revents) = fds[0].revents()
+            && revents.contains(PollFlags::POLLIN)
+        {
+            match nix::unistd::read(stdin_fd, &mut buf) {
+                Ok(0) => break,
+                Ok(n) => {
+                    write_all_raw(master_raw, &buf[..n]);
                 }
+                Err(nix::errno::Errno::EINTR) => {}
+                Err(_) => break,
             }
         }
     }
