@@ -5,20 +5,12 @@
 
 ## Problem
 
-Users running multiple Claude Code profiles (e.g., one for work using `~/.claude` and
-one personal using `~/.claude-tex`) cannot use ai-jail with the non-default profile.
-
-Two failures compound each other:
-
-1. **Alias does not survive bwrap.** A typical workaround is a shell alias like
-   `alias claudetex="CLAUDE_CONFIG_DIR=~/.claude-tex command claude"`. bwrap forks a
-   new process that does not inherit the parent shell's aliases, so executing
-   `ai-jail claudetex` fails with "command not found".
-
-2. **Non-default config dir is not mounted rw.** `DOTDIR_RW` in `sandbox/mod.rs` is a
-   hardcoded list. Only `.claude` is in it. Any other directory (`.claude-tex`,
-   `.claude-work`, etc.) either receives no mount or a read-only bind, making Claude
-   unable to write sessions, history, or settings.
+Claude Code supports `CLAUDE_CONFIG_DIR` to use a non-default config directory,
+enabling multiple independent profiles (e.g. `~/.claude` for work, `~/.claude-example`
+for a separate account). ai-jail does not expose this: `DOTDIR_RW` in `sandbox/mod.rs`
+is hardcoded to `.claude`, and there is no way to mount a different directory rw or
+inject `CLAUDE_CONFIG_DIR` into the sandbox. Users with multiple Claude profiles cannot
+use ai-jail with any profile other than the default.
 
 ## Solution
 
@@ -29,31 +21,26 @@ Add a `--claude-dir <path>` flag. When set, ai-jail:
 3. Adds the path to Landlock rw rules (Linux).
 4. Redirects `--bootstrap` output to the correct `settings.json` inside that dir.
 
-The user runs `claude` (the real binary), not `claudetex`. The flag carries the profile
-selection. No aliases, no shell environment tricks.
-
 ## User Experience
 
 ```bash
-# One-time setup in the personal project directory:
-ai-jail --claude-dir ~/.claude-tex --init claude
+# One-time setup per project:
+ai-jail --claude-dir ~/.claude-example --init claude
 
 # Every subsequent run in that directory:
 ai-jail claude   # .ai-jail already has claude_dir persisted
 ```
 
-The shell alias `claudetex` becomes unnecessary.
-
 ## Affected Files
 
-| File | Change |
-|------|--------|
-| `src/cli.rs` | Add `claude_dir: Option<PathBuf>` to `CliArgs`; parse `--claude-dir <path>` |
-| `src/config.rs` | Add `claude_dir: Option<PathBuf>` to `Config` with `#[serde(default)]` |
-| `src/sandbox/bwrap.rs` | Mount `claude_dir` as rw bind; inject `CLAUDE_CONFIG_DIR` via `--setenv` |
-| `src/sandbox/landlock.rs` | Add `claude_dir` path to rw Landlock rules |
-| `src/sandbox/seatbelt.rs` | Allow rw access to `claude_dir` in SBPL profile (macOS) |
-| `src/bootstrap.rs` | Use `claude_dir` in `claude_config_path()` when set |
+| File                      | Change                                                                      |
+| ------------------------- | --------------------------------------------------------------------------- |
+| `src/cli.rs`              | Add `claude_dir: Option<PathBuf>` to `CliArgs`; parse `--claude-dir <path>` |
+| `src/config.rs`           | Add `claude_dir: Option<PathBuf>` to `Config` with `#[serde(default)]`      |
+| `src/sandbox/bwrap.rs`    | Mount `claude_dir` as rw bind; inject `CLAUDE_CONFIG_DIR` via `--setenv`    |
+| `src/sandbox/landlock.rs` | Add `claude_dir` path to rw Landlock rules                                  |
+| `src/sandbox/seatbelt.rs` | Allow rw access to `claude_dir` in SBPL profile (macOS)                     |
+| `src/bootstrap.rs`        | Use `claude_dir` in `claude_config_path()` when set                         |
 
 ## Detailed Design
 
