@@ -10,6 +10,17 @@ mod sandbox;
 mod signals;
 mod statusbar;
 
+const BROWSER_COMMANDS: &[&str] = &[
+    "chromium",
+    "chromium-browser",
+    "google-chrome",
+    "google-chrome-stable",
+    "brave",
+    "brave-browser",
+    "firefox",
+    "librewolf",
+];
+
 fn command_basename(command: &[String]) -> Option<&str> {
     command.first().and_then(|cmd| {
         std::path::Path::new(cmd)
@@ -20,6 +31,44 @@ fn command_basename(command: &[String]) -> Option<&str> {
 
 fn command_needs_direct_tty(command: &[String]) -> bool {
     command_basename(command) == Some("crush")
+}
+
+fn command_is_browser(command: &[String]) -> bool {
+    command_basename(command)
+        .is_some_and(|name| BROWSER_COMMANDS.contains(&name))
+}
+
+fn resolve_browser_profile(
+    config: &config::Config,
+) -> Option<config::BrowserProfile> {
+    if config.browser_profile_disabled() {
+        return None;
+    }
+    config.browser_profile().or_else(|| {
+        if command_is_browser(&config.command) {
+            Some(config::BrowserProfile::Hard)
+        } else {
+            None
+        }
+    })
+}
+
+fn apply_browser_profile(config: &mut config::Config) {
+    let Some(profile) = resolve_browser_profile(config) else {
+        return;
+    };
+
+    config.browser_profile = Some(profile.as_str().into());
+    config.no_gpu.get_or_insert(true);
+    config.no_docker = Some(true);
+    config.no_display = Some(false);
+    config.no_worktree = Some(true);
+    config.no_mise = Some(true);
+    config.no_save_config = Some(true);
+    config.ssh = Some(false);
+    config.pictures = Some(false);
+    config.lockdown = Some(false);
+    config.no_status_bar = Some(true);
 }
 
 /// Detect a terminal multiplexer around the current process. Nested
@@ -120,7 +169,8 @@ fn run() -> Result<i32, String> {
     // rewrite the project's stored default to codex. Use `--init`
     // to explicitly change the stored command. See #20.
     let stored_command = existing.command.clone();
-    let config = config::merge(&cli, existing);
+    let mut config = config::merge(&cli, existing);
+    apply_browser_profile(&mut config);
 
     // Handle status command
     if cli.status {
@@ -329,10 +379,12 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::{
-        command_needs_direct_tty, running_inside_multiplexer,
+        apply_browser_profile, command_is_browser, command_needs_direct_tty,
+        resolve_browser_profile, running_inside_multiplexer,
         validate_write_flags,
     };
     use crate::cli::CliArgs;
+    use crate::config::{BrowserProfile, Config};
 
     // Serialize tests that mutate process-global env vars.
     static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
@@ -410,6 +462,70 @@ mod tests {
         assert!(!command_needs_direct_tty(&[]));
         assert!(!command_needs_direct_tty(&["codex".into()]));
         assert!(!command_needs_direct_tty(&["/usr/bin/bash".into()]));
+    }
+
+    #[test]
+    fn browser_detection_matches_common_browser_names() {
+        assert!(command_is_browser(&["chromium".into()]));
+        assert!(command_is_browser(&["/usr/bin/firefox".into()]));
+        assert!(command_is_browser(&["google-chrome-stable".into()]));
+        assert!(!command_is_browser(&["codex".into()]));
+    }
+
+    #[test]
+    fn browser_profile_auto_defaults_to_hard_for_browsers() {
+        let config = Config {
+            command: vec!["chromium".into()],
+            ..Config::default()
+        };
+        assert_eq!(
+            resolve_browser_profile(&config),
+            Some(BrowserProfile::Hard)
+        );
+    }
+
+    #[test]
+    fn browser_profile_explicit_soft_wins() {
+        let config = Config {
+            command: vec!["chromium".into()],
+            browser_profile: Some("soft".into()),
+            ..Config::default()
+        };
+        assert_eq!(
+            resolve_browser_profile(&config),
+            Some(BrowserProfile::Soft)
+        );
+    }
+
+    #[test]
+    fn browser_profile_can_be_disabled_for_browser_command() {
+        let config = Config {
+            command: vec!["chromium".into()],
+            browser_profile: Some("off".into()),
+            ..Config::default()
+        };
+        assert_eq!(resolve_browser_profile(&config), None);
+    }
+
+    #[test]
+    fn browser_profile_applies_hardened_defaults() {
+        let mut config = Config {
+            command: vec!["chromium".into()],
+            ..Config::default()
+        };
+        apply_browser_profile(&mut config);
+
+        assert_eq!(config.browser_profile.as_deref(), Some("hard"));
+        assert_eq!(config.no_gpu, Some(true));
+        assert_eq!(config.no_docker, Some(true));
+        assert_eq!(config.no_display, Some(false));
+        assert_eq!(config.no_worktree, Some(true));
+        assert_eq!(config.no_mise, Some(true));
+        assert_eq!(config.no_save_config, Some(true));
+        assert_eq!(config.ssh, Some(false));
+        assert_eq!(config.pictures, Some(false));
+        assert_eq!(config.lockdown, Some(false));
+        assert_eq!(config.no_status_bar, Some(true));
     }
 
     #[test]

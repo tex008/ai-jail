@@ -7,6 +7,29 @@ use std::path::{Path, PathBuf};
 
 const CONFIG_FILE: &str = ".ai-jail";
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BrowserProfile {
+    Hard,
+    Soft,
+}
+
+impl BrowserProfile {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            BrowserProfile::Hard => "hard",
+            BrowserProfile::Soft => "soft",
+        }
+    }
+}
+
+pub fn parse_browser_profile_spec(value: &str) -> Option<BrowserProfile> {
+    match value {
+        "hard" | "isolated" | "ephemeral" => Some(BrowserProfile::Hard),
+        "soft" | "persistent" | "survivable" => Some(BrowserProfile::Soft),
+        _ => None,
+    }
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Config {
     #[serde(default)]
@@ -35,6 +58,8 @@ pub struct Config {
     pub ssh: Option<bool>,
     #[serde(default)]
     pub pictures: Option<bool>,
+    #[serde(default)]
+    pub browser_profile: Option<String>,
     #[serde(default)]
     pub lockdown: Option<bool>,
     #[serde(default)]
@@ -80,6 +105,17 @@ impl Config {
     }
     pub fn pictures_enabled(&self) -> bool {
         self.pictures == Some(true)
+    }
+    pub fn browser_profile(&self) -> Option<BrowserProfile> {
+        self.browser_profile
+            .as_deref()
+            .and_then(parse_browser_profile_spec)
+    }
+    pub fn browser_profile_disabled(&self) -> bool {
+        matches!(
+            self.browser_profile.as_deref(),
+            Some("off" | "none" | "disabled")
+        )
     }
     pub fn landlock_enabled(&self) -> bool {
         self.no_landlock != Some(true)
@@ -193,6 +229,9 @@ pub fn merge_with_global(global: Config, local: Config) -> Config {
     }
     if local.pictures.is_some() {
         c.pictures = local.pictures;
+    }
+    if local.browser_profile.is_some() {
+        c.browser_profile = local.browser_profile;
     }
     if local.lockdown.is_some() {
         c.lockdown = local.lockdown;
@@ -408,6 +447,9 @@ pub fn merge(cli: &CliArgs, existing: Config) -> Config {
     if let Some(v) = cli.pictures {
         config.pictures = Some(v);
     }
+    if let Some(ref profile) = cli.browser_profile {
+        config.browser_profile = Some(profile.clone());
+    }
     if let Some(v) = cli.worktree {
         config.no_worktree = Some(!v);
     }
@@ -526,6 +568,13 @@ pub fn display_status(config: &Config) {
         Some(true) => output::status_header("  Pictures", "shared (read-only)"),
         _ => output::status_header("  Pictures", "hidden"),
     }
+    match config.browser_profile.as_deref() {
+        Some("off" | "none" | "disabled") => {
+            output::status_header("  Browser profile", "disabled")
+        }
+        Some(value) => output::status_header("  Browser profile", value),
+        None => output::status_header("  Browser profile", "auto"),
+    }
     bool_opt("Landlock", config.no_landlock);
     bool_opt("Seccomp", config.no_seccomp);
     bool_opt("Rlimits", config.no_rlimits);
@@ -598,6 +647,7 @@ no_docker = false
 no_display = true
 no_mise = false
 no_save_config = true
+browser_profile = "soft"
 lockdown = true
 "#;
         let cfg = parse_toml(toml).unwrap();
@@ -610,6 +660,8 @@ lockdown = true
         assert_eq!(cfg.no_worktree, None);
         assert_eq!(cfg.no_mise, Some(false));
         assert_eq!(cfg.no_save_config, Some(true));
+        assert_eq!(cfg.browser_profile.as_deref(), Some("soft"));
+        assert_eq!(cfg.browser_profile(), Some(BrowserProfile::Soft));
         assert_eq!(cfg.lockdown, Some(true));
     }
 
@@ -711,6 +763,7 @@ another_removed_field = true
         assert_eq!(cfg.no_landlock, None);
         assert_eq!(cfg.no_status_bar, None);
         assert_eq!(cfg.resize_redraw_key, None);
+        assert_eq!(cfg.browser_profile, None);
         assert_eq!(cfg.no_seccomp, None);
         assert_eq!(cfg.no_rlimits, None);
         assert!(cfg.allow_tcp_ports.is_empty());
@@ -867,6 +920,7 @@ allow_tcp_ports = []
             no_save_config: Some(true),
             ssh: Some(true),
             pictures: None,
+            browser_profile: Some("soft".into()),
             lockdown: Some(true),
             no_landlock: Some(false),
             no_status_bar: None,
@@ -888,6 +942,7 @@ allow_tcp_ports = []
         assert_eq!(deserialized.no_worktree, config.no_worktree);
         assert_eq!(deserialized.no_mise, config.no_mise);
         assert_eq!(deserialized.no_save_config, config.no_save_config);
+        assert_eq!(deserialized.browser_profile, config.browser_profile);
         assert_eq!(deserialized.lockdown, config.lockdown);
         assert_eq!(deserialized.no_landlock, config.no_landlock);
         assert_eq!(deserialized.resize_redraw_key, config.resize_redraw_key);
@@ -1118,6 +1173,36 @@ hide_dotdirs = [".my_secrets", ".proton", ".password-store"]
         };
         let merged = merge(&cli, existing);
         assert_eq!(merged.no_worktree, Some(true));
+    }
+
+    #[test]
+    fn merge_browser_profile_from_cli() {
+        let existing = Config::default();
+        let cli = CliArgs {
+            browser_profile: Some("soft".into()),
+            ..CliArgs::default()
+        };
+        let merged = merge(&cli, existing);
+        assert_eq!(merged.browser_profile.as_deref(), Some("soft"));
+        assert_eq!(merged.browser_profile(), Some(BrowserProfile::Soft));
+    }
+
+    #[test]
+    fn browser_profile_disabled_accessor() {
+        assert!(
+            !Config {
+                browser_profile: Some("hard".into()),
+                ..Config::default()
+            }
+            .browser_profile_disabled()
+        );
+        assert!(
+            Config {
+                browser_profile: Some("off".into()),
+                ..Config::default()
+            }
+            .browser_profile_disabled()
+        );
     }
 
     #[test]
@@ -1650,6 +1735,7 @@ allow_tcp_ports = [32000, 8080]
             no_save_config: Some(true),
             ssh: None,
             pictures: Some(true),
+            browser_profile: Some("hard".into()),
             lockdown: Some(false),
             no_landlock: None,
             no_status_bar: None,
@@ -1668,6 +1754,7 @@ allow_tcp_ports = [32000, 8080]
         assert_eq!(loaded.lockdown, Some(false));
         assert_eq!(loaded.allow_tcp_ports, vec![32000]);
         assert_eq!(loaded.resize_redraw_key, None);
+        assert_eq!(loaded.browser_profile.as_deref(), Some("hard"));
 
         // Cleanup
         std::env::set_current_dir(&original_dir).unwrap();

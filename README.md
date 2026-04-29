@@ -183,6 +183,28 @@ Persistence: `--lockdown` alone doesn't write `.ai-jail` (keeps runs ephemeral).
 
 `--init` always writes config, so it cannot be combined with `--no-save-config`.
 
+## Browser profiles
+
+ai-jail can run browsers in a separate locked-down browser profile. Browser commands are auto-detected for Chromium, Chrome, Brave, Firefox, and LibreWolf, or you can opt in explicitly:
+
+```bash
+ai-jail chromium              # auto: hard browser profile
+ai-jail --browser chromium    # explicit hard profile
+ai-jail --browser=soft firefox
+ai-jail --no-browser chromium # disable browser auto-profile
+```
+
+Both browser profiles avoid the real host browser profiles. They use a private `$HOME`, keep the project mounted read-only, skip SSH keys, Docker, linked worktree metadata, extra maps, mise, config auto-save, and the terminal status bar. Display and network stay enabled so the browser can actually open and navigate sites.
+
+- **Hard profile** (`--browser` / `--browser=hard`): all browser config, cache, history, cookies, extension state, and sessions live under sandbox tmpfs paths and disappear when the browser exits.
+- **Soft profile** (`--browser=soft`): browser state survives only under `~/.local/share/ai-jail/browsers/<browser>`, so future ai-jail browser sessions can keep logins and history without touching `~/.config/chromium`, `~/.mozilla`, or other real browser profiles.
+
+Chromium-family browsers run with Chromium's internal sandbox disabled inside ai-jail because the Chromium zygote/setuid sandbox does not work reliably through the bwrap/user namespace setup. The containment boundary is ai-jail's bwrap mount/process namespace plus Landlock/seccomp, not Chromium's own sandbox. Browser profiles also disable browser GPU acceleration by default to avoid probing unmapped DRM devices; pass `--gpu` if you want ai-jail to expose GPU devices and leave Chromium GPU acceleration enabled.
+
+Expected Chromium terminal noise: D-Bus, systemd, UPower, Google Cloud Messaging, and EGL/WebGPU warnings can appear because browser profiles deliberately do not expose the host system bus or full desktop session. These messages are usually harmless if the browser window works. `--gpu` may add EGL/WebGPU capability warnings; omit `--gpu` for the quieter default software path.
+
+This is useful for testing suspect extensions or websites without giving them read-write access to your normal home directory or browser profile. It is not an anonymity feature: the browser still has network access, sites can fingerprint it, and anything you log into can identify you.
+
 ## What gets sandboxed
 
 ### Default behavior (no flags needed)
@@ -201,6 +223,8 @@ Persistence: `--lockdown` alone doesn't write `.ai-jail` (keeps runs ephemeral).
 | `/dev/shm` | device | Shared memory (Chromium needs this) |
 
 In `--lockdown`, project is mounted read-only and host write mounts are removed. For linked Git worktrees, validated external Git metadata is still exposed read-only unless disabled with `--no-worktree`.
+
+In browser profile mode, the project is mounted read-only, `$HOME` is private tmpfs, normal host dotdirs are not mounted, and soft browser state is the only persistent browser-specific write mount.
 
 ### Home directory handling
 
@@ -282,6 +306,7 @@ ai-jail [OPTIONS] [--] [COMMAND [ARGS...]]
 
 | Command | What it does |
 |---------|-------------|
+| `gemini` | Run Gemini CLI |
 | `claude` | Run Claude Code |
 | `codex` | Run GPT Codex |
 | `opencode` | Run OpenCode |
@@ -312,6 +337,7 @@ If no command is given and no `.ai-jail` config exists, defaults to `bash`.
 | `--mise` / `--no-mise` | Enable/disable mise integration |
 | `--ssh` / `--no-ssh` | Share `~/.ssh` read-only + forward `SSH_AUTH_SOCK` (default: off) |
 | `--pictures` / `--no-pictures` | Share `~/Pictures` read-only (default: off) |
+| `--browser[=PROFILE]` / `--no-browser` | Enable/disable browser isolation profile. `PROFILE` is `hard` (ephemeral, default) or `soft` (persistent under `~/.local/share/ai-jail/browsers/<browser>`). Common browser commands auto-enable `hard` unless disabled. |
 | `--save-config` / `--no-save-config` | Enable/disable automatic `.ai-jail` writes |
 | `-s`, `--status-bar[=STYLE]` | Enable persistent status line. `STYLE` is `pastel` (default, random palette per session), `dark`, or `light` |
 | `--no-status-bar` | Disable persistent status line |
@@ -356,6 +382,12 @@ ai-jail --ssh claude
 
 # Share ~/Pictures read-only (e.g. for image analysis)
 ai-jail --pictures claude
+
+# Run Chromium with an ephemeral browser profile
+ai-jail chromium
+
+# Run Firefox with a persistent ai-jail-only browser profile
+ai-jail --browser=soft firefox
 
 # Hide .env and other secrets from the agent
 ai-jail --mask .env --mask .env.local claude
@@ -414,6 +446,7 @@ When CLI flags and an existing config are both present:
 | `no_mise` | bool | not set (auto) | `true` disables mise integration |
 | `ssh` | bool | not set (off) | `true` shares `~/.ssh` read-only + forwards `SSH_AUTH_SOCK` |
 | `pictures` | bool | not set (off) | `true` shares `~/Pictures` read-only |
+| `browser_profile` | string | not set (auto) | Browser isolation profile: `"hard"` for ephemeral state, `"soft"` for persistent ai-jail-only state, or `"off"` to disable browser auto-detection |
 | `no_save_config` | bool | not set (enabled) | `true` disables automatic `.ai-jail` writes |
 | `no_landlock` | bool | not set (auto) | `true` disables Landlock LSM (Linux only) |
 | `no_seccomp` | bool | not set (auto) | `true` disables seccomp syscall filter (Linux only) |

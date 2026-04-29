@@ -132,6 +132,34 @@ pub struct LaunchCommand {
     pub args: Vec<String>,
 }
 
+fn browser_basename(program: &str) -> Option<&str> {
+    let name = Path::new(program).file_name()?.to_str()?;
+    match name {
+        "chromium"
+        | "chromium-browser"
+        | "google-chrome"
+        | "google-chrome-stable"
+        | "brave"
+        | "brave-browser"
+        | "firefox"
+        | "librewolf" => Some(name),
+        _ => None,
+    }
+}
+
+pub(crate) fn browser_state_dir(config: &Config) -> Option<PathBuf> {
+    let profile = config.browser_profile()?;
+    let browser = browser_basename(config.command.first()?)?;
+    match profile {
+        crate::config::BrowserProfile::Hard => None,
+        crate::config::BrowserProfile::Soft => Some(
+            home_dir()
+                .join(".local/share/ai-jail/browsers")
+                .join(browser),
+        ),
+    }
+}
+
 /// Build the list of dotdir names exempted from the deny list by
 /// explicit user flags (e.g. --ssh exempts ".ssh").
 pub fn dotdir_exemptions(config: &Config) -> Vec<&'static str> {
@@ -342,8 +370,109 @@ fn mise_wrapper_command(
     }
 }
 
+fn browser_profile_launch_command(
+    config: &Config,
+    mut user_cmd: LaunchCommand,
+) -> LaunchCommand {
+    let Some(profile) = config.browser_profile() else {
+        return user_cmd;
+    };
+    let Some(browser) = browser_basename(&user_cmd.program) else {
+        return user_cmd;
+    };
+
+    match browser {
+        "firefox" | "librewolf" => {
+            let profile_dir = match profile {
+                crate::config::BrowserProfile::Hard => {
+                    format!("/tmp/ai-jail-browser-{browser}")
+                }
+                crate::config::BrowserProfile::Soft => {
+                    browser_state_dir(config)
+                        .unwrap_or_else(|| {
+                            home_dir()
+                                .join(".local/share/ai-jail/browsers")
+                                .join(browser)
+                        })
+                        .display()
+                        .to_string()
+                }
+            };
+            user_cmd.args.extend([
+                "--no-remote".into(),
+                "--profile".into(),
+                profile_dir,
+            ]);
+        }
+        _ => {
+            let data_dir = match profile {
+                crate::config::BrowserProfile::Hard => {
+                    format!("/tmp/ai-jail-browser-{browser}/data")
+                }
+                crate::config::BrowserProfile::Soft => {
+                    browser_state_dir(config)
+                        .unwrap_or_else(|| {
+                            home_dir()
+                                .join(".local/share/ai-jail/browsers")
+                                .join(browser)
+                        })
+                        .join("data")
+                        .display()
+                        .to_string()
+                }
+            };
+            let cache_dir = match profile {
+                crate::config::BrowserProfile::Hard => {
+                    format!("/tmp/ai-jail-browser-{browser}/cache")
+                }
+                crate::config::BrowserProfile::Soft => {
+                    browser_state_dir(config)
+                        .unwrap_or_else(|| {
+                            home_dir()
+                                .join(".local/share/ai-jail/browsers")
+                                .join(browser)
+                        })
+                        .join("cache")
+                        .display()
+                        .to_string()
+                }
+            };
+            user_cmd.args.extend([
+                // The outer ai-jail sandbox provides process/filesystem
+                // isolation. Chromium's own zygote/setuid sandbox does not
+                // survive this bwrap/userns setup reliably, so browser
+                // profiles run Chromium without its internal sandbox.
+                "--no-sandbox".into(),
+                // Suppresses Chromium's unsupported-flag infobar for the
+                // intentional --no-sandbox flag above.
+                "--test-type".into(),
+                "--disable-crash-reporter".into(),
+                "--disable-breakpad".into(),
+                "--no-first-run".into(),
+                "--no-default-browser-check".into(),
+                "--disable-background-networking".into(),
+                "--disable-sync".into(),
+                "--password-store=basic".into(),
+                format!("--user-data-dir={data_dir}"),
+                format!("--disk-cache-dir={cache_dir}"),
+            ]);
+            if !config.gpu_enabled() {
+                user_cmd.args.extend([
+                    "--disable-gpu".into(),
+                    "--disable-gpu-compositing".into(),
+                    "--disable-accelerated-video-decode".into(),
+                    "--disable-accelerated-video-encode".into(),
+                ]);
+            }
+        }
+    }
+
+    user_cmd
+}
+
 pub fn build_launch_command(config: &Config) -> LaunchCommand {
-    let user_cmd = default_launch_command(config);
+    let user_cmd =
+        browser_profile_launch_command(config, default_launch_command(config));
     if config.lockdown_enabled() || !config.mise_enabled() {
         return user_cmd;
     }
@@ -549,6 +678,87 @@ mod tests {
         let cmd = build_launch_command(&cfg);
         assert_eq!(cmd.program, "claude");
         assert!(cmd.args.is_empty());
+    }
+
+    #[test]
+    fn browser_hard_profile_adds_chromium_ephemeral_args() {
+        let cfg = Config {
+            command: vec!["chromium".into()],
+            browser_profile: Some("hard".into()),
+            no_mise: Some(true),
+            no_gpu: Some(true),
+            ..Config::default()
+        };
+        let cmd = build_launch_command(&cfg);
+        assert_eq!(cmd.program, "chromium");
+        assert!(cmd.args.contains(&"--no-sandbox".into()));
+        assert!(cmd.args.contains(&"--test-type".into()));
+        assert!(cmd.args.contains(&"--disable-breakpad".into()));
+        assert!(cmd.args.contains(&"--disable-gpu".into()));
+        assert!(cmd.args.contains(&"--no-first-run".into()));
+        assert!(cmd.args.contains(&"--disable-sync".into()));
+        assert!(cmd.args.contains(&"--password-store=basic".into()));
+        assert!(
+            cmd.args.iter().any(|arg| arg
+                == "--user-data-dir=/tmp/ai-jail-browser-chromium/data")
+        );
+        assert!(
+            cmd.args.iter().any(|arg| arg
+                == "--disk-cache-dir=/tmp/ai-jail-browser-chromium/cache")
+        );
+    }
+
+    #[test]
+    fn browser_soft_profile_uses_ai_jail_state_dir() {
+        let cfg = Config {
+            command: vec!["chromium".into()],
+            browser_profile: Some("soft".into()),
+            no_mise: Some(true),
+            ..Config::default()
+        };
+        let cmd = build_launch_command(&cfg);
+        let state = browser_state_dir(&cfg).unwrap();
+
+        assert!(state.ends_with(".local/share/ai-jail/browsers/chromium"));
+        assert!(cmd.args.iter().any(|arg| {
+            arg == &format!("--user-data-dir={}", state.join("data").display())
+        }));
+        assert!(cmd.args.iter().any(|arg| {
+            arg == &format!(
+                "--disk-cache-dir={}",
+                state.join("cache").display()
+            )
+        }));
+    }
+
+    #[test]
+    fn browser_chromium_profile_respects_explicit_gpu() {
+        let cfg = Config {
+            command: vec!["chromium".into()],
+            browser_profile: Some("hard".into()),
+            no_mise: Some(true),
+            no_gpu: Some(false),
+            ..Config::default()
+        };
+        let cmd = build_launch_command(&cfg);
+
+        assert!(!cmd.args.contains(&"--disable-gpu".into()));
+        assert!(!cmd.args.contains(&"--disable-gpu-compositing".into()));
+    }
+
+    #[test]
+    fn browser_firefox_profile_adds_isolated_profile_args() {
+        let cfg = Config {
+            command: vec!["firefox".into()],
+            browser_profile: Some("hard".into()),
+            no_mise: Some(true),
+            ..Config::default()
+        };
+        let cmd = build_launch_command(&cfg);
+        assert_eq!(cmd.program, "firefox");
+        assert!(cmd.args.contains(&"--no-remote".into()));
+        assert!(cmd.args.contains(&"--profile".into()));
+        assert!(cmd.args.contains(&"/tmp/ai-jail-browser-firefox".into()));
     }
 
     #[test]

@@ -133,6 +133,8 @@ fn generate_sbpl_profile(
     enable_docker: bool,
     lockdown: bool,
 ) -> String {
+    let browser_mode = config.browser_profile().is_some();
+    let restricted_files = lockdown || browser_mode;
     let exempt = super::dotdir_exemptions(config);
     let mut deny_paths = macos_read_deny_paths(&config.hide_dotdirs, &exempt);
     // Extend deny list with user-specified mask paths
@@ -193,8 +195,8 @@ fn generate_sbpl_profile(
         profile.push_str("(allow system-socket)\n\n");
     }
 
-    if lockdown {
-        profile.push_str("; File reads: lockdown allow-list\n");
+    if restricted_files {
+        profile.push_str("; File reads: restricted allow-list\n");
         for rd_path in macos_lockdown_read_paths(config, project_dir) {
             let canonical = canonicalize_or_keep(&rd_path);
             let escaped = sbpl_escape(canonical.to_string_lossy().as_ref());
@@ -334,6 +336,24 @@ fn macos_writable_paths(
 
     let home = super::home_dir();
     let mut paths = Vec::new();
+
+    if config.browser_profile().is_some() {
+        if let Some(state) = super::browser_state_dir(config) {
+            let _ = std::fs::create_dir_all(&state);
+            paths.push(state);
+        }
+        paths.push(PathBuf::from("/tmp"));
+        paths.push(PathBuf::from("/private/tmp"));
+        paths.push(PathBuf::from("/private/var/tmp"));
+        if let Ok(tmpdir) = std::env::var("TMPDIR") {
+            let p = PathBuf::from(&tmpdir);
+            if super::path_exists(&p) {
+                paths.push(canonicalize_or_keep(&p));
+            }
+        }
+        paths.push(PathBuf::from("/private/var/folders"));
+        return paths;
+    }
 
     paths.push(project_dir.to_path_buf());
 

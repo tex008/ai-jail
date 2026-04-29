@@ -79,13 +79,14 @@ struct MountSet {
     ssh_agent: Vec<Mount>,
     ssh_env: Vec<(String, String)>,
     pictures: Vec<Mount>,
+    browser_state: Vec<Mount>,
     extra: Vec<Mount>,
     project: Vec<Mount>,
     mask: Vec<Mount>,
 }
 
 impl MountSet {
-    fn ordered_mounts(&self) -> [&[Mount]; 16] {
+    fn ordered_mounts(&self) -> [&[Mount]; 17] {
         [
             &self.base,
             &self.sys_masks,
@@ -100,6 +101,7 @@ impl MountSet {
             &self.git_worktree,
             &self.ssh_agent,
             &self.pictures,
+            &self.browser_state,
             &self.extra,
             &self.project,
             &self.mask,
@@ -593,19 +595,24 @@ fn landlock_wrapper_args(config: &Config, verbose: bool) -> Vec<String> {
     if config.pictures_enabled() {
         args.push("--pictures".into());
     }
+    if let Some(profile) = config.browser_profile() {
+        args.push(format!("--browser={}", profile.as_str()));
+    }
 
     for port in config.allow_tcp_ports() {
         args.push("--allow-tcp-port".into());
         args.push(port.to_string());
     }
 
-    for path in &config.rw_maps {
-        args.push("--rw-map".into());
-        args.push(path.display().to_string());
-    }
-    for path in &config.ro_maps {
-        args.push("--map".into());
-        args.push(path.display().to_string());
+    if config.browser_profile().is_none() {
+        for path in &config.rw_maps {
+            args.push("--rw-map".into());
+            args.push(path.display().to_string());
+        }
+        for path in &config.ro_maps {
+            args.push("--map".into());
+            args.push(path.display().to_string());
+        }
     }
     for path in &config.mask {
         args.push("--mask".into());
@@ -834,6 +841,9 @@ fn discover_mounts(
     verbose: bool,
 ) -> MountSet {
     let lockdown = config.lockdown_enabled();
+    let browser_profile = config.browser_profile();
+    let browser_mode = browser_profile.is_some();
+    let private_home = lockdown || browser_mode;
     let enable_gpu = !lockdown && config.gpu_enabled();
     let enable_docker = !lockdown && config.docker_enabled();
     let enable_display = !lockdown && config.display_enabled();
@@ -848,31 +858,32 @@ fn discover_mounts(
     // SSH: agent socket + tmpfs over /etc/ssh/ssh_config.d to
     // prevent "bad owner or permissions" errors (bwrap's user
     // namespace remaps root-owned config files to nobody).
-    let (ssh_agent_mount, ssh_env) = if !lockdown && config.ssh_enabled() {
-        let mut mounts = vec![Mount::Tmpfs {
-            dest: "/etc/ssh/ssh_config.d".into(),
-        }];
-        let mut env = vec![];
-        if let Ok(sock) = std::env::var("SSH_AUTH_SOCK") {
-            let sock_path = PathBuf::from(&sock);
-            if sock_path.exists() {
-                if verbose {
-                    output::verbose(&format!(
-                        "SSH agent: {}",
-                        sock_path.display()
-                    ));
+    let (ssh_agent_mount, ssh_env) =
+        if !lockdown && !browser_mode && config.ssh_enabled() {
+            let mut mounts = vec![Mount::Tmpfs {
+                dest: "/etc/ssh/ssh_config.d".into(),
+            }];
+            let mut env = vec![];
+            if let Ok(sock) = std::env::var("SSH_AUTH_SOCK") {
+                let sock_path = PathBuf::from(&sock);
+                if sock_path.exists() {
+                    if verbose {
+                        output::verbose(&format!(
+                            "SSH agent: {}",
+                            sock_path.display()
+                        ));
+                    }
+                    mounts.push(Mount::Bind {
+                        src: sock_path.clone(),
+                        dest: sock_path,
+                    });
+                    env.push(("SSH_AUTH_SOCK".into(), sock));
                 }
-                mounts.push(Mount::Bind {
-                    src: sock_path.clone(),
-                    dest: sock_path,
-                });
-                env.push(("SSH_AUTH_SOCK".into(), sock));
             }
-        }
-        (mounts, env)
-    } else {
-        (vec![], vec![])
-    };
+            (mounts, env)
+        } else {
+            (vec![], vec![])
+        };
 
     // Mask: replace each path with an empty tempfile (or tmpfs
     // for directories). Paths are resolved absolutely; relative
@@ -881,40 +892,44 @@ fn discover_mounts(
         build_mask_mounts(&config.mask, project_dir, empty_path, verbose);
 
     // Pictures: read-only bind of $HOME/Pictures when enabled
-    let pictures_mount = if !lockdown && config.pictures_enabled() {
-        let p = super::home_dir().join("Pictures");
-        if p.is_dir() {
-            vec![Mount::RoBind {
-                src: p.clone(),
-                dest: p,
-            }]
+    let pictures_mount =
+        if !lockdown && !browser_mode && config.pictures_enabled() {
+            let p = super::home_dir().join("Pictures");
+            if p.is_dir() {
+                vec![Mount::RoBind {
+                    src: p.clone(),
+                    dest: p,
+                }]
+            } else {
+                vec![]
+            }
         } else {
             vec![]
-        }
-    } else {
-        vec![]
-    };
+        };
+
+    let browser_state_mount =
+        discover_browser_state_mount(config, browser_profile, verbose);
 
     MountSet {
         base: discover_base(hosts_file, resolv_mount),
         sys_masks: discover_sys_masks(lockdown),
         home_dotfiles: discover_home_dotfiles(
-            lockdown,
+            private_home,
             &config.hide_dotdirs,
             &exempt,
             verbose,
         ),
-        config_hide: if lockdown {
+        config_hide: if private_home {
             vec![]
         } else {
             discover_subdir_hide(".config", CONFIG_DENY)
         },
-        cache_hide: if lockdown {
+        cache_hide: if private_home {
             vec![]
         } else {
             discover_subdir_hide(".cache", CACHE_DENY)
         },
-        local_overrides: if lockdown {
+        local_overrides: if private_home {
             vec![]
         } else {
             discover_local_overrides()
@@ -936,14 +951,42 @@ fn discover_mounts(
         ssh_agent: ssh_agent_mount,
         ssh_env,
         pictures: pictures_mount,
-        extra: if lockdown {
+        browser_state: browser_state_mount,
+        extra: if lockdown || browser_mode {
             vec![]
         } else {
             extra_mounts(&config.rw_maps, &config.ro_maps)
         },
-        project: project_mount(project_dir, lockdown),
+        project: project_mount(project_dir, lockdown || browser_mode),
         mask: mask_mounts,
     }
+}
+
+fn discover_browser_state_mount(
+    config: &Config,
+    profile: Option<crate::config::BrowserProfile>,
+    verbose: bool,
+) -> Vec<Mount> {
+    if profile != Some(crate::config::BrowserProfile::Soft) {
+        return vec![];
+    }
+    let Some(path) = super::browser_state_dir(config) else {
+        return vec![];
+    };
+    if let Err(e) = std::fs::create_dir_all(&path) {
+        output::warn(&format!(
+            "Browser profile: cannot create {}: {e}",
+            path.display()
+        ));
+        return vec![];
+    }
+    if verbose {
+        output::verbose(&format!("Browser profile: {} rw", path.display()));
+    }
+    vec![Mount::Bind {
+        src: path.clone(),
+        dest: path,
+    }]
 }
 
 /// Build bwrap mounts that replace each user-specified path with
@@ -1671,6 +1714,87 @@ mod tests {
     }
 
     #[test]
+    fn browser_profile_project_is_read_only_without_network_lockdown() {
+        let mut config = minimal_test_config();
+        config.command = vec!["chromium".into()];
+        config.browser_profile = Some("hard".into());
+        config.rw_maps = vec![PathBuf::from("/usr/bin")];
+        let guard =
+            SandboxGuard::test_with_hosts(PathBuf::from("/tmp/test-hosts"));
+        let project = PathBuf::from("/home/user/project");
+
+        let args = build_dry_run_args(
+            &config,
+            &project,
+            guard.hosts_path(),
+            guard.resolv_mount(),
+            guard.empty_path(),
+            false,
+        )
+        .unwrap();
+
+        assert!(args.windows(3).any(|w| {
+            w[0] == "--ro-bind"
+                && w[1] == "/home/user/project"
+                && w[2] == "/home/user/project"
+        }));
+        assert!(
+            !args.contains(&"--unshare-net".to_string()),
+            "browser profiles keep network access for browsing"
+        );
+        assert!(
+            !args.windows(3).any(|w| {
+                w[0] == "--bind" && w[1] == "/usr/bin" && w[2] == "/usr/bin"
+            }),
+            "browser profiles ignore extra rw maps"
+        );
+    }
+
+    #[test]
+    fn browser_soft_profile_mounts_only_ai_jail_browser_state() {
+        let _env = ENV_LOCK.lock().unwrap();
+        let saved_home = std::env::var_os("HOME");
+        let home = std::env::temp_dir()
+            .join(format!("ai-jail-browser-home-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&home);
+        unsafe { std::env::set_var("HOME", &home) };
+
+        let mut config = minimal_test_config();
+        config.command = vec!["chromium".into()];
+        config.browser_profile = Some("soft".into());
+        let guard =
+            SandboxGuard::test_with_hosts(PathBuf::from("/tmp/test-hosts"));
+        let project = home.join("project");
+
+        let args = build_dry_run_args(
+            &config,
+            &project,
+            guard.hosts_path(),
+            guard.resolv_mount(),
+            guard.empty_path(),
+            false,
+        )
+        .unwrap();
+
+        let state = home.join(".local/share/ai-jail/browsers/chromium");
+        assert!(state.is_dir());
+        assert!(args.windows(3).any(|w| {
+            w[0] == "--bind"
+                && w[1] == state.display().to_string()
+                && w[2] == state.display().to_string()
+        }));
+
+        unsafe {
+            if let Some(value) = saved_home {
+                std::env::set_var("HOME", value);
+            } else {
+                std::env::remove_var("HOME");
+            }
+        }
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
     fn lockdown_forces_new_session() {
         // --new-session must be present in lockdown mode regardless of
         // whether stdin is a terminal. The README documents lockdown as
@@ -1943,6 +2067,21 @@ mod tests {
             .map(|w| w[1].clone())
             .collect();
         assert_eq!(port_args, vec!["32000", "8080"]);
+    }
+
+    #[test]
+    fn browser_wrapper_skips_extra_maps() {
+        let mut config = minimal_test_config();
+        config.command = vec!["chromium".into()];
+        config.browser_profile = Some("hard".into());
+        config.rw_maps = vec![PathBuf::from("/tmp/browser-rw")];
+        config.ro_maps = vec![PathBuf::from("/tmp/browser-ro")];
+
+        let wrapper_args = landlock_wrapper_args(&config, false);
+
+        assert!(!wrapper_args.contains(&"--rw-map".into()));
+        assert!(!wrapper_args.contains(&"--map".into()));
+        assert!(wrapper_args.contains(&"--browser=hard".into()));
     }
 
     #[test]

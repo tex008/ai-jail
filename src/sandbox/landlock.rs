@@ -364,6 +364,7 @@ fn collect_normal_paths(
     verbose: bool,
 ) -> (Vec<PathBuf>, Vec<PathBuf>) {
     let home = super::home_dir();
+    let browser_mode = config.browser_profile().is_some();
     let mut ro = Vec::new();
     let mut rw = Vec::new();
 
@@ -406,12 +407,19 @@ fn collect_normal_paths(
         rw.push(shm);
     }
 
-    // Project directory: read-write — the agent's primary work
-    // area. Must be writable so it can edit source, run builds,
-    // and create output files.
-    rw.push(project_dir.to_path_buf());
+    // Project directory: browsers only need read access. Normal
+    // agent sessions keep write access so they can edit source.
+    if browser_mode {
+        ro.push(project_dir.to_path_buf());
+    } else {
+        rw.push(project_dir.to_path_buf());
+    }
     if verbose {
-        output::verbose(&format!("Landlock: {} rw", project_dir.display()));
+        output::verbose(&format!(
+            "Landlock: {} {}",
+            project_dir.display(),
+            if browser_mode { "ro" } else { "rw" }
+        ));
     }
 
     // $HOME: read-write.  Inside the sandbox $HOME is a tmpfs,
@@ -429,18 +437,30 @@ fn collect_normal_paths(
     // .ssh, .gnupg are denied entirely (never bind-mounted by
     // bwrap, so Landlock allowing them is moot — but we still
     // skip them for defense-in-depth). Everything else is ro.
-    let exempt = super::dotdir_exemptions(config);
-    collect_home_paths(
-        &home,
-        &config.hide_dotdirs,
-        &exempt,
-        &mut ro,
-        &mut rw,
-        verbose,
-    );
+    if !browser_mode {
+        let exempt = super::dotdir_exemptions(config);
+        collect_home_paths(
+            &home,
+            &config.hide_dotdirs,
+            &exempt,
+            &mut ro,
+            &mut rw,
+            verbose,
+        );
+    }
+
+    if let Some(path) = super::browser_state_dir(config) {
+        if verbose {
+            output::verbose(&format!(
+                "Landlock: browser profile {} rw",
+                path.display()
+            ));
+        }
+        rw.push(path);
+    }
 
     // Pictures: read-only when enabled
-    if config.pictures_enabled() {
+    if !browser_mode && config.pictures_enabled() {
         let pics = home.join("Pictures");
         if pics.is_dir() {
             if verbose {
@@ -451,7 +471,8 @@ fn collect_normal_paths(
     }
 
     // SSH agent socket: read-write when --ssh is enabled
-    if config.ssh_enabled()
+    if !browser_mode
+        && config.ssh_enabled()
         && let Ok(sock) = std::env::var("SSH_AUTH_SOCK")
     {
         let sock_path = PathBuf::from(&sock);
@@ -500,8 +521,9 @@ fn collect_normal_paths(
         ro.push(gitconfig);
     }
 
-    if let Some(paths) =
-        super::discover_git_worktree_paths(config, project_dir, verbose)
+    if !browser_mode
+        && let Some(paths) =
+            super::discover_git_worktree_paths(config, project_dir, verbose)
     {
         for path in paths.unique_paths() {
             if verbose {
@@ -517,28 +539,31 @@ fn collect_normal_paths(
     // Extra user mounts: --rw-map and --ro-map from CLI/config.
     // These extend the sandbox with user-specified paths. Missing
     // paths are skipped with a warning (never crash on missing).
-    for p in &config.rw_maps {
-        if super::path_exists(p) {
-            rw.push(p.clone());
-        } else {
-            output::warn(&format!(
-                "Landlock: rw map {} not found, skipping",
-                p.display()
-            ));
+    if !browser_mode {
+        for p in &config.rw_maps {
+            if super::path_exists(p) {
+                rw.push(p.clone());
+            } else {
+                output::warn(&format!(
+                    "Landlock: rw map {} not found, skipping",
+                    p.display()
+                ));
+            }
         }
-    }
-    for p in &config.ro_maps {
-        if super::path_exists(p) {
-            ro.push(p.clone());
-        } else {
-            output::warn(&format!(
-                "Landlock: ro map {} not found, skipping",
-                p.display()
-            ));
+        for p in &config.ro_maps {
+            if super::path_exists(p) {
+                ro.push(p.clone());
+            } else {
+                output::warn(&format!(
+                    "Landlock: ro map {} not found, skipping",
+                    p.display()
+                ));
+            }
         }
-    }
-    if verbose && (!config.rw_maps.is_empty() || !config.ro_maps.is_empty()) {
-        output::verbose("Landlock: extra maps");
+        if verbose && (!config.rw_maps.is_empty() || !config.ro_maps.is_empty())
+        {
+            output::verbose("Landlock: extra maps");
+        }
     }
 
     // Docker socket: read-write — allows the agent to build and
@@ -813,6 +838,53 @@ mod tests {
         let project = PathBuf::from("/tmp/test-proj");
         let (_, rw) = collect_normal_paths(&config, &project, false);
         assert!(rw.contains(&project), "project must be in rw list");
+    }
+
+    #[test]
+    fn browser_paths_project_is_readonly() {
+        let config = Config {
+            command: vec!["chromium".into()],
+            browser_profile: Some("hard".into()),
+            no_gpu: Some(true),
+            no_docker: Some(true),
+            ..Config::default()
+        };
+        let project = PathBuf::from("/tmp/test-proj");
+        let (ro, rw) = collect_normal_paths(&config, &project, false);
+        assert!(ro.contains(&project), "browser project must be ro");
+        assert!(!rw.contains(&project), "browser project must not be rw");
+    }
+
+    #[test]
+    fn browser_soft_paths_include_persistent_state_rw() {
+        let _env = ENV_LOCK.lock().unwrap();
+        let saved_home = std::env::var_os("HOME");
+        let home = std::env::temp_dir().join(format!(
+            "ai-jail-landlock-browser-home-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::create_dir_all(&home);
+        unsafe { std::env::set_var("HOME", &home) };
+
+        let config = Config {
+            command: vec!["chromium".into()],
+            browser_profile: Some("soft".into()),
+            no_gpu: Some(true),
+            no_docker: Some(true),
+            ..Config::default()
+        };
+        let state = super::super::browser_state_dir(&config).unwrap();
+        let (_, rw) = collect_normal_paths(&config, Path::new("/tmp"), false);
+        assert!(rw.contains(&state));
+
+        unsafe {
+            if let Some(value) = saved_home {
+                std::env::set_var("HOME", value);
+            } else {
+                std::env::remove_var("HOME");
+            }
+        }
+        let _ = std::fs::remove_dir_all(&home);
     }
 
     #[test]

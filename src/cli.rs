@@ -29,6 +29,8 @@ OPTIONS:
     --no-mise / --mise             Disable/enable mise integration
     --ssh / --no-ssh               Share ~/.ssh read-only + forward SSH_AUTH_SOCK (default: off)
     --pictures / --no-pictures     Share ~/Pictures read-only (default: off)
+    --browser[=PROFILE]            Use browser isolation profile (hard | soft; default hard)
+    --no-browser                   Disable browser auto-detection/profile
     --save-config / --no-save-config
                                    Enable/disable automatic .ai-jail writes
     -s, --status-bar[=STYLE]       Set status line theme (pastel | dark | light; default pastel)
@@ -64,6 +66,7 @@ pub struct CliArgs {
     pub save_config: Option<bool>,
     pub ssh: Option<bool>,
     pub pictures: Option<bool>,
+    pub browser_profile: Option<String>,
     pub status_bar: Option<bool>,
     pub status_bar_style: Option<String>,
     pub allow_tcp_ports: Vec<u16>,
@@ -158,6 +161,24 @@ pub fn parse_from(mut parser: lexopt::Parser) -> Result<CliArgs, String> {
             Long("no-ssh") => args.ssh = Some(false),
             Long("pictures") => args.pictures = Some(true),
             Long("no-pictures") => args.pictures = Some(false),
+            Long("browser") => {
+                let profile = if let Some(val) = parser.optional_value() {
+                    let s = val.to_string_lossy();
+                    match s.as_ref() {
+                        "hard" | "soft" => s.into_owned(),
+                        _ => {
+                            return Err(format!(
+                                "invalid browser profile: \
+                                 {s} (expected 'hard' or 'soft')"
+                            ));
+                        }
+                    }
+                } else {
+                    "hard".into()
+                };
+                args.browser_profile = Some(profile);
+            }
+            Long("no-browser") => args.browser_profile = Some("off".into()),
             Long("status-bar") | Short('s') => {
                 if let Some(val) = parser.optional_value() {
                     let s = val.to_string_lossy();
@@ -406,6 +427,32 @@ mod tests {
     fn parse_no_pictures() {
         let args = parse_test(&["--no-pictures", "bash"]).unwrap();
         assert_eq!(args.pictures, Some(false));
+    }
+
+    #[test]
+    fn parse_browser_default_hard() {
+        let args = parse_test(&["--browser", "chromium"]).unwrap();
+        assert_eq!(args.browser_profile.as_deref(), Some("hard"));
+        assert_eq!(args.command, vec!["chromium"]);
+    }
+
+    #[test]
+    fn parse_browser_soft() {
+        let args = parse_test(&["--browser=soft", "firefox"]).unwrap();
+        assert_eq!(args.browser_profile.as_deref(), Some("soft"));
+        assert_eq!(args.command, vec!["firefox"]);
+    }
+
+    #[test]
+    fn parse_no_browser() {
+        let args = parse_test(&["--no-browser", "chromium"]).unwrap();
+        assert_eq!(args.browser_profile.as_deref(), Some("off"));
+    }
+
+    #[test]
+    fn parse_browser_invalid_errors() {
+        let result = parse_test(&["--browser=maybe", "chromium"]);
+        assert!(result.is_err());
     }
 
     #[test]
