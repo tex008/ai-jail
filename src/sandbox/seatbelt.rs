@@ -134,7 +134,8 @@ fn generate_sbpl_profile(
     lockdown: bool,
 ) -> String {
     let browser_mode = config.browser_profile().is_some();
-    let restricted_files = lockdown || browser_mode;
+    let private_home = config.private_home_enabled();
+    let restricted_files = lockdown || browser_mode || private_home;
     let exempt = super::dotdir_exemptions(config);
     let mut deny_paths = macos_read_deny_paths(&config.hide_dotdirs, &exempt);
     // Extend deny list with user-specified mask paths
@@ -337,7 +338,10 @@ fn macos_writable_paths(
     let home = super::home_dir();
     let mut paths = Vec::new();
 
-    if config.browser_profile().is_some() {
+    let browser_mode = config.browser_profile().is_some();
+    let private_home = config.private_home_enabled();
+
+    if browser_mode {
         if let Some(state) = super::browser_state_dir(config) {
             let _ = std::fs::create_dir_all(&state);
             paths.push(state);
@@ -363,21 +367,23 @@ fn macos_writable_paths(
         paths.extend(worktree.unique_paths());
     }
 
-    for name in super::DOTDIR_RW {
-        let p = home.join(name);
-        if super::path_exists(&p) {
-            paths.push(p);
+    if !private_home {
+        for name in super::DOTDIR_RW {
+            let p = home.join(name);
+            if super::path_exists(&p) {
+                paths.push(p);
+            }
         }
-    }
 
-    let local = home.join(".local");
-    if super::path_exists(&local) {
-        paths.push(local);
-    }
+        let local = home.join(".local");
+        if super::path_exists(&local) {
+            paths.push(local);
+        }
 
-    let claude_json = home.join(".claude.json");
-    if claude_json.is_file() {
-        paths.push(claude_json);
+        let claude_json = home.join(".claude.json");
+        if claude_json.is_file() {
+            paths.push(claude_json);
+        }
     }
 
     paths.push(PathBuf::from("/tmp"));
@@ -395,9 +401,11 @@ fn macos_writable_paths(
     paths.push(PathBuf::from("/private/var/folders"));
 
     // macOS-native caches (Xcode tooling, Homebrew, etc.)
-    let lib_caches = home.join("Library/Caches");
-    if super::path_exists(&lib_caches) {
-        paths.push(lib_caches);
+    if !private_home {
+        let lib_caches = home.join("Library/Caches");
+        if super::path_exists(&lib_caches) {
+            paths.push(lib_caches);
+        }
     }
 
     for p in &config.rw_maps {
@@ -463,6 +471,35 @@ fn macos_lockdown_read_paths(
         }
     }
 
+    let browser_mode = config.browser_profile().is_some();
+    let private_home = config.private_home_enabled();
+
+    if browser_mode {
+        if let Some(state) = super::browser_state_dir(config) {
+            push_unique(canonicalize_or_keep(&state));
+        }
+    }
+
+    if private_home && !browser_mode && !config.lockdown_enabled() {
+        for p in config.rw_maps.iter().chain(config.ro_maps.iter()) {
+            if super::path_exists(p) {
+                push_unique(canonicalize_or_keep(p));
+            }
+        }
+        if config.ssh_enabled() {
+            let ssh_dir = super::home_dir().join(".ssh");
+            if ssh_dir.is_dir() {
+                push_unique(canonicalize_or_keep(&ssh_dir));
+            }
+        }
+        if config.pictures_enabled() {
+            let pictures = super::home_dir().join("Pictures");
+            if pictures.is_dir() {
+                push_unique(canonicalize_or_keep(&pictures));
+            }
+        }
+    }
+
     if let Ok(tmpdir) = std::env::var("TMPDIR") {
         let p = PathBuf::from(tmpdir);
         if super::path_exists(&p) {
@@ -477,6 +514,8 @@ fn macos_lockdown_read_paths(
 mod tests {
     use super::*;
     use std::time::{SystemTime, UNIX_EPOCH};
+
+    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     struct LinkedWorktreeFixture {
         root: PathBuf,
@@ -597,6 +636,58 @@ mod tests {
         let project = PathBuf::from("/tmp/test-project");
         let paths = macos_writable_paths(&project, &config, true);
         assert!(paths.is_empty());
+    }
+
+    #[test]
+    fn private_home_writable_paths_skip_host_home_state() {
+        let _env = ENV_LOCK.lock().unwrap();
+        let saved_home = std::env::var_os("HOME");
+        let home = std::env::temp_dir().join(format!(
+            "ai-jail-seatbelt-private-home-{}",
+            std::process::id()
+        ));
+        let project = home.join("project");
+        let extra = home.join("extra");
+        std::fs::create_dir_all(home.join(".config")).unwrap();
+        std::fs::create_dir_all(home.join(".local")).unwrap();
+        std::fs::create_dir_all(home.join("Library/Caches")).unwrap();
+        std::fs::create_dir_all(&project).unwrap();
+        std::fs::create_dir_all(&extra).unwrap();
+        unsafe { std::env::set_var("HOME", &home) };
+
+        let config = Config {
+            private_home: Some(true),
+            rw_maps: vec![extra.clone()],
+            ..Config::default()
+        };
+        let paths = macos_writable_paths(&project, &config, false);
+
+        assert!(paths.contains(&project));
+        assert!(paths.contains(&extra));
+        assert!(!paths.contains(&home.join(".config")));
+        assert!(!paths.contains(&home.join(".local")));
+        assert!(!paths.contains(&home.join("Library/Caches")));
+
+        unsafe {
+            if let Some(value) = saved_home {
+                std::env::set_var("HOME", value);
+            } else {
+                std::env::remove_var("HOME");
+            }
+        }
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn private_home_profile_uses_restricted_reads() {
+        let config = Config {
+            private_home: Some(true),
+            ..Config::default()
+        };
+        let project = PathBuf::from("/tmp/test-project");
+        let profile = generate_sbpl_profile(&config, &project, false, false);
+        assert!(profile.contains("; File reads: restricted allow-list"));
+        assert!(!profile.contains("(allow file-read*)\n"));
     }
 
     #[test]

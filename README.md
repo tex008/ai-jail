@@ -133,6 +133,8 @@ mask = [".env", ".env.local", "credentials.json"]
 **Private home mode**: use `--private-home` when you want the project writable
 but do not want normal host dotdirs like `~/.config`, `~/.cache`, `~/.local`,
 or AI tool state mounted into the sandbox. Explicit mounts still apply.
+On Linux, this uses a tmpfs `$HOME`; on macOS, seatbelt rules deny normal
+host-home reads/writes instead.
 
 ```bash
 ai-jail --private-home claude
@@ -235,13 +237,13 @@ In `--lockdown`, project is mounted read-only and host write mounts are removed.
 
 In browser profile mode, the project is mounted read-only, `$HOME` is private tmpfs, normal host dotdirs are not mounted, and soft browser state is the only persistent browser-specific write mount.
 
-In `--private-home` mode, `$HOME` is also private tmpfs and normal host dotdirs are not mounted, but the project remains read-write and explicit `--map` / `--rw-map` mounts still work. This is useful for non-agent or experimental workloads where you want normal project access without exposing your real `~/.config`, `~/.cache`, or tool state.
+In `--private-home` mode, normal host dotdirs are not exposed, but the project remains read-write and explicit `--map` / `--rw-map` mounts still work. On Linux this is a private tmpfs `$HOME`; on macOS it is enforced with seatbelt read/write allowlists because `sandbox-exec` cannot create a replacement home mount. This is useful for non-agent or experimental workloads where you want normal project access without exposing your real `~/.config`, `~/.cache`, or tool state.
 
 ### Home directory handling
 
 Your real `$HOME` is replaced with a tmpfs. Dotfiles and dotdirs are selectively layered on top:
 
-Pass `--private-home` or set `private_home = true` to skip this automatic dotdir layering entirely. `--ssh`, `--pictures`, `--map`, and `--rw-map` remain explicit opt-ins.
+Pass `--private-home` or set `private_home = true` to skip this automatic dotdir layering entirely. `--ssh`, `--pictures`, `--map`, and `--rw-map` remain explicit opt-ins. On macOS, `sandbox-exec` does not provide tmpfs mounts, so ai-jail approximates this by denying normal host-home reads and writes.
 
 **Never mounted (sensitive data):**
 - `.gnupg`, `.aws`, `.ssh`, `.mozilla`, `.basilisk-dev`, `.sparrow`
@@ -339,7 +341,7 @@ If no command is given and no `.ai-jail` config exists, defaults to `bash`.
 | `--hide-dotdir <NAME>` | Never bind-mount the named home dotdir into the sandbox (e.g. `.my_secrets`). Leading dot is optional. Repeatable. Cannot hide dotdirs required for tool operation (`.cargo`, `.config`, `.cache`, etc.) — those emit a warning and stay visible. |
 | `--mask <PATH>` | Replace `PATH` inside the sandbox with an empty file (or empty tmpfs if the path is a directory). Relative paths resolve against the project directory. Repeatable. Useful for hiding sensitive files like `.env`, `credentials.json` from AI agents while keeping the rest of the project accessible. Missing paths are skipped with a warning. |
 | `--allow-tcp-port <PORT>` | Permit outbound TCP to PORT in lockdown mode (repeatable). Skips `--unshare-net` and uses Landlock V4 `NetPort` rules to deny everything else. Requires Linux ≥ 6.5; hard-fails otherwise. No effect outside lockdown or on macOS. |
-| `--private-home` / `--no-private-home` | Enable/disable private home mode. Private home keeps `$HOME` as tmpfs and skips automatic host dotdir passthrough while leaving the project writable and explicit maps active. |
+| `--private-home` / `--no-private-home` | Enable/disable private home mode. Private home skips automatic host dotdir passthrough while leaving the project writable and explicit maps active. Linux uses tmpfs `$HOME`; macOS uses seatbelt allowlists. |
 | `--lockdown` / `--no-lockdown` | Enable/disable strict read-only lockdown mode |
 | `--landlock` / `--no-landlock` | Enable/disable Landlock LSM (Linux 5.13+, default: on) |
 | `--seccomp` / `--no-seccomp` | Enable/disable seccomp syscall filter (Linux, default: on) |
@@ -457,7 +459,7 @@ When CLI flags and an existing config are both present:
 | `hide_dotdirs` | string array | `[]` | Extra home dotdirs to deny (e.g. `[".my_secrets"]`). Leading dot optional. Built-in deny list (`.ssh`, `.gnupg`, `.aws`, `.mozilla`) always applies. |
 | `mask` | path array | `[]` | Paths to replace with empty files/tmpfs (e.g. `[".env", "secrets.json"]`). Relative paths resolve against the project directory. |
 | `allow_tcp_ports` | u16 array | `[]` | TCP ports permitted outbound in lockdown mode (e.g. `[32000, 8080]`). Requires Linux ≥ 6.5 for Landlock V4. No effect outside lockdown. |
-| `private_home` | bool | not set (off) | `true` keeps `$HOME` private tmpfs and skips automatic host dotdir passthrough without enabling full lockdown. Project and explicit maps remain writable. |
+| `private_home` | bool | not set (off) | `true` skips automatic host dotdir passthrough without enabling full lockdown. Project and explicit maps remain writable. Linux uses tmpfs `$HOME`; macOS uses seatbelt allowlists. |
 | `no_gpu` | bool | not set (auto) | `true` disables GPU passthrough |
 | `no_docker` | bool | not set (auto) | `true` disables Docker socket |
 | `no_display` | bool | not set (auto) | `true` disables X11/Wayland |
