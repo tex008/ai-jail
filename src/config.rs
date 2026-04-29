@@ -283,6 +283,10 @@ pub fn save_global(config: &Config) {
     let Some(path) = global_config_path() else {
         return;
     };
+    save_global_to_path(&path, config);
+}
+
+fn save_global_to_path(path: &Path, config: &Config) {
     let mut global = load_from_path(&path);
     if config.no_status_bar.is_some() {
         global.no_status_bar = config.no_status_bar;
@@ -290,7 +294,7 @@ pub fn save_global(config: &Config) {
     if config.status_bar_style.is_some() {
         global.status_bar_style = config.status_bar_style.clone();
     }
-    save_to_path(&path, &global);
+    save_to_path(path, &global);
 }
 
 fn save_to_path(path: &Path, config: &Config) {
@@ -1716,39 +1720,35 @@ allow_tcp_ports = [32000, 8080]
 
     #[test]
     fn save_global_status_bar_theme_persists() {
-        let _env = ENV_LOCK.lock().unwrap();
-        let home = std::env::temp_dir()
+        let dir = std::env::temp_dir()
             .join(format!("ai-jail-home-global-{}", std::process::id()));
-        let _ = std::fs::create_dir_all(&home);
-        unsafe { std::env::set_var("HOME", &home) };
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join(".ai-jail");
 
         let cfg = Config {
             no_status_bar: None,
             status_bar_style: Some("dark".into()),
             ..Config::default()
         };
-        save_global(&cfg);
+        save_global_to_path(&path, &cfg);
 
-        let global = load_global();
+        let global = load_from_path(&path);
         assert_eq!(global.no_status_bar, None);
         assert_eq!(global.status_bar_style.as_deref(), Some("dark"));
 
-        unsafe { std::env::remove_var("HOME") };
-        let _ = std::fs::remove_file(home.join(".ai-jail"));
-        let _ = std::fs::remove_dir_all(&home);
+        let _ = std::fs::remove_file(path);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
     fn save_global_theme_does_not_reenable_disabled_status_bar() {
-        let _env = ENV_LOCK.lock().unwrap();
-        let home = std::env::temp_dir().join(format!(
+        let dir = std::env::temp_dir().join(format!(
             "ai-jail-home-global-preserve-{}",
             std::process::id()
         ));
-        let _ = std::fs::create_dir_all(&home);
-        unsafe { std::env::set_var("HOME", &home) };
+        let _ = std::fs::create_dir_all(&dir);
 
-        let path = home.join(".ai-jail");
+        let path = dir.join(".ai-jail");
         let existing = Config {
             no_status_bar: Some(true),
             status_bar_style: Some("light".into()),
@@ -1761,15 +1761,14 @@ allow_tcp_ports = [32000, 8080]
             status_bar_style: Some("dark".into()),
             ..Config::default()
         };
-        save_global(&cfg);
+        save_global_to_path(&path, &cfg);
 
-        let global = load_global();
+        let global = load_from_path(&path);
         assert_eq!(global.no_status_bar, Some(true));
         assert_eq!(global.status_bar_style.as_deref(), Some("dark"));
 
-        unsafe { std::env::remove_var("HOME") };
-        let _ = std::fs::remove_file(home.join(".ai-jail"));
-        let _ = std::fs::remove_dir_all(&home);
+        let _ = std::fs::remove_file(path);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
